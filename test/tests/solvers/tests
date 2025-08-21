@@ -64,4 +64,15 @@
       devices = 'cpu cuda mps'
     []
   []
+  [etdrk4]
+    requirement = 'The system shall provide an ETDRK4 semi-implicit time integrator'
+    [substeps_10]
+      type = CSVDiff
+      input = etdrk4.i
+      csvdiff = etdrk4_10.csv
+      cli_args = 'ss=10'
+      requirement = 'with ten substeps'
+      devices = 'cpu cuda mps'
+    []
+  []
 []
