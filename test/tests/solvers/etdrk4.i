@@ -94,6 +94,16 @@
   type = TensorProblem
 []
 
+[TensorOutputs]
+  active = ''
+  [xdmf]
+    type = XDMFTensorOutput
+    buffer = 'u v'
+    enable_hdf5 = true
+    transpose = false
+  []
+[]
+
 [Postprocessors]
   [u_min]
     type = TensorExtremeValuePostprocessor
