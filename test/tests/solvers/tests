@@ -64,4 +64,14 @@
       devices = 'cpu cuda mps'
     []
   []
+  [etdrk4]
+    requirement = 'The system shall provide an exponential time differencing RK4 solver'
+    [diffusion]
+      type = CSVDiff
+      input = diffusion_etdrk4.i
+      csvdiff = diffusion_etdrk4.csv
+      requirement = 'matches analytical diffusion solution'
+      devices = 'cpu cuda mps'
+    []
+  []
 []
