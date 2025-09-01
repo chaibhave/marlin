@@ -7,6 +7,10 @@
   xmax = '${fparse 2*pi}'
 []
 
+[GlobalParams]
+  expand = REAL
+[]
+
 [TensorComputes]
   [Initialize]
     [u]
@@ -14,7 +18,6 @@
       buffer = u
       extra_symbols = true
       expression = 'sin(x)'
-      expand = REAL
     []
 
     [Du]
@@ -24,18 +27,18 @@
     []
 
     [zero]
-      type = ConstantTensor
+      type = ConstantReciprocalTensor
       buffer = zero
-      real = 0
     []
   []
 
   [Solve]
-    [source_u_bar]
+    [ubar]
       type = ForwardFFT
-      buffer = source_u_bar
-      input = zero
+      buffer = ubar
+      input = u
     []
+
   []
 
   [Postprocess]
@@ -43,7 +46,7 @@
       type = ParsedCompute
       buffer = exact_u
       extra_symbols = true
-      expression = 'sin(x)*exp(-time)'
+      expression = 'sin(x)*exp(-t)'
       expand = REAL
     []
 
@@ -63,12 +66,32 @@
   []
 []
 
+[TensorOutputs]
+    [xdmf]
+        type = XDMFTensorOutput
+        buffer = 'u exact_u err2 err'
+        enable_hdf5 = true
+        transpose = false
+    []
+[]
+
 [TensorSolver]
   type = ETDRK4Solver
   buffer = u
+  reciprocal_buffer = ubar
   linear_reciprocal = Du
-  nonlinear_reciprocal = source_u_bar
+  nonlinear_reciprocal = zero
 []
+# [TensorSolver]
+#   type = AdamsBashforthMoulton
+#   buffer = u
+#   reciprocal_buffer = ubar
+#   linear_reciprocal = Du
+#   nonlinear_reciprocal = zero
+#   corrector_order = 5
+#   predictor_order = 5
+#   corrector_steps = 10
+# []
 
 [Problem]
   type = TensorProblem
@@ -83,7 +106,7 @@
 
 [Executioner]
   type = Transient
-  dt = 0.1
+  dt = 10
   num_steps = 1
 []
 
