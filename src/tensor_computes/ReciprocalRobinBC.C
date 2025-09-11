@@ -58,9 +58,7 @@ ReciprocalRobinBC::computeBuffer()
 
     _grad_psi_by_psi =
         torch::where(_psi_thresh,
-                     torch::sqrt(torch::square(grad_psi_x) + torch::square(grad_psi_y) +
-                                 torch::square(grad_psi_z)) /
-                         _psi,
+                     torch::norm(torch::stack({grad_psi_x, grad_psi_y, grad_psi_z}), 2, 0) / _psi,
                      0);
     _grad_psi_x_by_psi_sq = torch::where(_psi_thresh, grad_psi_x / psi_sq, 0.0);
     _grad_psi_y_by_psi_sq = torch::where(_psi_thresh, grad_psi_y / psi_sq, 0.0);
@@ -78,9 +76,10 @@ ReciprocalRobinBC::computeBuffer()
     auto J_x = _M * _domain.ifft(_i * _domain.fft(_psi * _chem_pot) * _imag);
     auto J_y = _M * _domain.ifft(_j * _domain.fft(_psi * _chem_pot) * _imag);
     auto J_z = _M * _domain.ifft(_z * _domain.fft(_psi * _chem_pot) * _imag);
-    robin_bc -= (1 - _W_N)*( _grad_psi_x_by_psi_sq * J_x + _grad_psi_y_by_psi_sq * J_y + _grad_psi_z_by_psi_sq * J_z
-        +  _B_D*torch::square(_grad_psi_by_psi) );
+    robin_bc -=
+        (1 - _W_N) * (_grad_psi_x_by_psi_sq * J_x + _grad_psi_y_by_psi_sq * J_y +
+                      _grad_psi_z_by_psi_sq * J_z - _B_D * _M * torch::square(_grad_psi_by_psi) );
   }
 
-  _u = robin_bc;
+  _u = _domain.fft(robin_bc);
 }

@@ -5,7 +5,7 @@
 #
 
 # Constants for Initial Conditions
-l = 4.2
+l = 4
 
 # Phase-field model parameters
 kappa_eta = 5
@@ -17,13 +17,13 @@ c0_a = 0.3
 c0_b = 0.7
 
 # Expressions for switching function and bulk Gibbs energy
-h_eta = 'eta^3*(6*eta^2-15*eta+10)'
+h_eta = '(eta^3*(6*eta^2-15*eta+10))'
 F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (1-${h_eta})*(${rho_sq}*((c + (${h_eta})*(${c0_b} - ${c0_a}))-${c0_b})^2 ) + ${w}*(eta^2)*(1-eta)^2'
 
 [Domain]
     dim = 2
-    nx = 100
-    ny = 100
+    nx = 200
+    ny = 200
 
     xmin = -50
     xmax = 50
@@ -47,7 +47,7 @@ F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (
             y2 = 55
             buffer = c
             int_width = ${l}
-            profile = TANH
+            profile = COS
             inside = ${c0_a}
             outside = ${c0_b}
         []
@@ -59,7 +59,7 @@ F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (
             y2 = 55
             buffer = eta
             int_width = ${l}
-            profile = TANH
+            profile = COS
             inside = 1
             outside = 0
         []
@@ -70,7 +70,7 @@ F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (
             y1 = -55
             y2 = 55
             buffer = psi
-            int_width = ${l}
+            int_width = ${fparse ${l} / 2 }
             profile = COS
             inside = 1
             outside = 0
@@ -79,10 +79,19 @@ F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (
             type = ConstantReciprocalTensor
             buffer = zero
         []
+        [zero_real]
+            type = ConstantTensor
+            buffer = zero_real
+        []
         [M]
             type = ConstantTensor
             buffer = M
             real = ${M}
+        []
+        [two_M]
+            type = ConstantTensor
+            buffer = two_M
+            real = ${fparse 10 * ${M} }
         []
         [L]
             type = ConstantTensor
@@ -93,6 +102,35 @@ F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (
             type = ConstantTensor
             buffer = L_kappa
             real = '${fparse  ${L} * ${kappa_eta} }'
+        []
+        [smooth]
+            type = DeAliasingTensor
+            buffer = smooth
+            method = SHARP
+        []
+        [W_N]
+            type = SmoothRectangleCompute
+            x1 = -45
+            x2 = 0
+            y1 = -55
+            y2 = 55
+            buffer = W_N
+            inside = 0
+            outside = 1
+            int_width = ${l}
+            profile = COS
+        []
+        [B_D]
+            type = SmoothRectangleCompute
+            x1 = -45
+            x2 = 0
+            y1 = -55
+            y2 = 55
+            buffer = B_D
+            inside = 0.4
+            outside = 0.0
+            int_width = ${l}
+            profile = COS
         []
     []
     [Solve]
@@ -120,6 +158,27 @@ F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (
             mobility = M
             psi = psi
         []
+        [robin_BC]
+            type = ReciprocalRobinBC
+            buffer = robin_BC
+            chemical_potential = mu
+            mobility = two_M
+            B_D = B_D
+            B_N = zero_real
+            W_N = W_N
+            psi = psi
+        []
+        [real_robin_out]
+            type = InverseFFT
+            buffer = real_robin_out
+            input = robin_BC
+        []
+        [NL_c]
+            type = ParsedCompute
+            buffer = NL_c
+            inputs = 'div_J smooth robin_BC'
+            expression = 'smooth * (div_J + robin_BC )'
+        []
         [domega_chem_deta]
             type = ParsedCompute
             buffer = 'domega_chem_deta'
@@ -144,8 +203,8 @@ F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (
         [AC_bar]
             type = ParsedCompute
             buffer = AC_bar
-            expression = 'kappa_grad_eta + AC_bulk'
-            inputs = 'AC_bulk kappa_grad_eta'
+            expression = 'smooth*(kappa_grad_eta + AC_bulk)'
+            inputs = 'AC_bulk kappa_grad_eta smooth'
         []
     []
 []
@@ -155,9 +214,11 @@ F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (
     buffer = 'c eta'
     reciprocal_buffer = 'cbar etabar'
     linear_reciprocal = 'zero zero'
-    nonlinear_reciprocal = 'div_J AC_bar'
+    nonlinear_reciprocal = 'NL_c AC_bar'
     substeps = 1e3
     predictor_order = 3
+    corrector_order = 1
+    corrector_steps = 1
 []
 
 [Postprocessors]
@@ -180,7 +241,8 @@ F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (
 [TensorOutputs]
     [xdmf]
         type = XDMFTensorOutput
-        buffer = 'eta c mu psi domega_chem_deta'
+        buffer = 'eta c mu psi domega_chem_deta B_D real_robin_out'
+        output_mode = 'node node node node node node node'
         enable_hdf5 = true
         transpose = false
     []
@@ -188,9 +250,8 @@ F = '${h_eta}*(${rho_sq}*((c - (1-${h_eta})*(${c0_b} - ${c0_a}))-${c0_a})^2) + (
 
 [Executioner]
     type = Transient
-    dt = 0.1
-    end_time = 10
-    # num_steps = 1
+    dt = 0.01
+    end_time = 100
 []
 
 [Outputs]
