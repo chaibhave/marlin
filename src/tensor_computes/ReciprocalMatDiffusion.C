@@ -41,6 +41,8 @@ ReciprocalMatDiffusion::ReciprocalMatDiffusion(const InputParameters & parameter
 void
 ReciprocalMatDiffusion::computeBuffer()
 {
+  using namespace torch::indexing;
+
   if (_update_psi || _always_update_psi)
   {
     _psi_thresh = _psi > 0.0;
@@ -54,13 +56,24 @@ ReciprocalMatDiffusion::computeBuffer()
   }
 
   auto psi_M = _M * _psi_thresh;
-  auto J_x = psi_M * _domain.ifft(_i * _domain.fft(_chem_pot) * _imag);
-  auto J_y = psi_M * _domain.ifft(_j * _domain.fft(_chem_pot) * _imag);
-  auto J_z = psi_M * _domain.ifft(_k * _domain.fft(_chem_pot) * _imag);
 
-  auto div_J_hat = _imag * (_i * _domain.fft(J_x) + _j * _domain.fft(J_y) + _k * _domain.fft(J_z));
+  // Handle both scalar and tensor diffusivity
+
+  auto grad_chem_pot = torch::stack({_domain.ifft(_i * _domain.fft(_chem_pot) * _imag),
+                                     _domain.ifft(_j * _domain.fft(_chem_pot) * _imag),
+                                     _domain.ifft(_k * _domain.fft(_chem_pot) * _imag)},
+                                    -1);
+  std::cout << grad_chem_pot.sizes() << std::endl;
+
+  auto J = torch::einsum("ij...,j...->i...", {psi_M, grad_chem_pot});
+
+  std::cout << "J shape = " << J.sizes() << std::endl;
+  auto div_J_hat = _imag * (_i * _domain.fft(J.index({Ellipsis,0})) + _j * _domain.fft(J.index({Ellipsis,1})) +
+                            _k * _domain.fft(J.index({Ellipsis,2})));
+  std::cout << "div_J_hat shape = " << div_J_hat.sizes() << std::endl;
+
   auto no_flux_hat =
-      _domain.fft(_grad_psi_x_by_psi * J_x + _grad_psi_y_by_psi * J_y + _grad_psi_z_by_psi * J_z);
-
+      _domain.fft(_grad_psi_x_by_psi * J.index({Ellipsis,0}) + _grad_psi_y_by_psi * J.index({Ellipsis,1}) +
+                  _grad_psi_z_by_psi * J.index({Ellipsis,2}));
   _u = div_J_hat + no_flux_hat;
 }
