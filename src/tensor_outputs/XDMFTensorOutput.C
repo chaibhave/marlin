@@ -36,6 +36,10 @@ XDMFTensorOutput::validParams()
 #ifdef LIBMESH_HAVE_HDF5
   params.addParam<bool>("enable_hdf5", false, "Use HDF5 for binary data storage.");
 #endif
+  params.addParam<unsigned int>(
+      "interval",
+      1,
+      "The number of time steps between successive outputs when executing at TIMESTEP_END.");
   MultiMooseEnum outputMode("CELL NODE OVERSIZED_NODAL");
   outputMode.addDocumentation("CELL", "Output as discontinuous elemental fields.");
   outputMode.addDocumentation(
@@ -58,6 +62,7 @@ XDMFTensorOutput::XDMFTensorOutput(const InputParameters & parameters)
   : TensorOutput(parameters),
     _dim(_domain.getDim()),
     _frame(0),
+    _interval(getParam<unsigned int>("interval")),
     _transpose(getParam<bool>("transpose"))
 #ifdef LIBMESH_HAVE_HDF5
     ,
@@ -65,6 +70,9 @@ XDMFTensorOutput::XDMFTensorOutput(const InputParameters & parameters)
     _hdf5_name(_file_base + ".h5")
 #endif
 {
+  if (_interval == 0)
+    paramError("interval", "The output interval must be greater than zero.");
+
   const auto output_mode = getParam<MultiMooseEnum>("output_mode").getSetValueIDs<OutputMode>();
   const auto nbuffers = _out_buffers.size();
 
@@ -104,6 +112,22 @@ XDMFTensorOutput::~XDMFTensorOutput()
   if (_enable_hdf5)
     H5Fclose(_hdf5_file_id);
 #endif
+}
+
+bool
+XDMFTensorOutput::shouldRun(const ExecFlagType & execute_flag) const
+{
+  if (!TensorOutput::shouldRun(execute_flag))
+    return false;
+
+  if (execute_flag != EXEC_TIMESTEP_END || _interval == 1)
+    return true;
+
+  const auto step = _tensor_problem.timeStep();
+  if (step == 0)
+    return true;
+
+  return ((step - 1) % _interval) == 0;
 }
 
 void

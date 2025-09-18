@@ -28,6 +28,7 @@ public:
   ~XDMFTensorOutput();
 
   virtual void init() override;
+  virtual bool shouldRun(const ExecFlagType & execute_flag) const override;
 
 protected:
   virtual void output() override;
@@ -52,6 +53,9 @@ protected:
 
   /// outputted frame
   std::size_t _frame;
+
+  /// output interval in time steps
+  const unsigned int _interval;
 
   /// transpose tensors before outputting to counter a Paraview XDMF reader ideosyncracy
   const bool _transpose;

@@ -10,6 +10,11 @@ and can be selected using the [!param](/TensorOutputs/XDMFTensorOutput/output_mo
 results in a value per simulation grid cell (e.g. `N[0] * N[1] * N[2]` entries), while for node centered output
 the cell edge nodes are periodically replicated, resulting in `(N[0]+1) * (N[1]+1) * (N[2]+1)` exported entries.
 
+The [!param](/TensorOutputs/XDMFTensorOutput/interval) parameter limits the frequency of
+time-step based executions in the same manner as the [!param](/Outputs/interval) option in the
+standard [Moose Outputs block](syntax/Outputs/index.md). When set to `n`, the output object writes
+results on every `n`-th time step while still honoring any `execute_on` settings.
+
 ## Overview
 
 !! Replace these lines with information regarding the XDMFTensorOutput object.
