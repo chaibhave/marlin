@@ -1,4 +1,4 @@
-l = 1
+l = 2
 r0 = 6
 
 x_mid = '${fparse ( ${Domain/xmin} + ${Domain/xmax} ) / 2 }'
@@ -83,7 +83,6 @@ circle_IC = '0.5 - 0.5*tanh(2*(${r_xy}-${r0})/${l})'
             GB = gb
             buffer = D
         []
-
         [c]
             type = ParsedCompute
             buffer = 'c'
@@ -95,6 +94,19 @@ circle_IC = '0.5 - 0.5*tanh(2*(${r_xy}-${r0})/${l})'
             buffer = psi
             real = 1
         []
+        [smooth]
+            type = DeAliasingTensor
+            method = HOULI
+            buffer = smooth
+        []
+
+    []
+    [Solve]
+        [cbar]
+            type = ForwardFFT
+            buffer = cbar
+            input = c
+        []
         [div_J]
             type = ReciprocalMatDiffusion
             buffer = 'div_J'
@@ -102,7 +114,25 @@ circle_IC = '0.5 - 0.5*tanh(2*(${r_xy}-${r0})/${l})'
             mobility = D
             psi = psi
         []
+        [NL]
+            type = ParsedCompute
+            buffer = NL
+            inputs = 'div_J smooth'
+            expression = 'smooth * div_J'
+        []
     []
+[]
+
+[TensorSolver]
+    type = AdamsBashforthMoulton
+    buffer = 'c'
+    reciprocal_buffer = 'cbar'
+    linear_reciprocal = '0'
+    nonlinear_reciprocal = 'NL'
+    substeps = 1000
+    predictor_order = 3
+    corrector_order = 1
+    corrector_steps = 2
 []
 
 [Problem]
@@ -112,14 +142,15 @@ circle_IC = '0.5 - 0.5*tanh(2*(${r_xy}-${r0})/${l})'
 [TensorOutputs]
     [xdmf]
         type = XDMFTensorOutput
-        buffer = 'gb D upper circle eta1 eta2 eta3'
+        buffer = 'gb D upper circle eta1 eta2 eta3 c'
         enable_hdf5 = true
     []
 []
 
 [Executioner]
     type = Transient
-    num_steps = 0
+    dt = 0.01
+    num_steps = 1000
 []
 
 [Outputs]
