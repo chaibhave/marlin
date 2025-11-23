@@ -51,6 +51,17 @@
     compute_devices = 'cpu cuda mps'
   []
 
+  [xdmf_output_interval]
+    type = XMLDiff
+    input = cahnhilliard.i
+    cli_args = 'TensorOutputs/active="xdmf" TensorOutputs/xdmf/interval=2 TensorOutputs/xdmf/file_base=xdmf_interval'
+    xmldiff = xdmf_interval.xmf
+    issues = '#6'
+    requirement = 'The system shall be able to control the frequency of XDMF outputs using an interval setting'
+    design = 'XDMFTensorOutput.md'
+    devices = 'cpu cuda mps'
+  []
+
   [xdmf_output_hdf5_threading_error]
     type = RunException
     input = cahnhilliard.i
