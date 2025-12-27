@@ -217,4 +217,20 @@
       max_parallel = 1
     []
   []
+  [etdrk4]
+    requirement = 'The system shall provide an exponential time differencing RK4 solver'
+    [diffusion]
+      type = CSVDiff
+      input = diffusion_etdrk4.i
+      csvdiff = diffusion_etdrk4.csv
+      requirement = 'matches analytical diffusion solution'
+    [substeps_10]
+      type = CSVDiff
+      input = etdrk4.i
+      csvdiff = etdrk4_10.csv
+      cli_args = 'ss=10'
+      requirement = 'with ten substeps'
+      devices = 'cpu cuda mps'
+    []
+  []
 []
