@@ -59,6 +59,7 @@
     [smooth]
       type = DeAliasingTensor
       buffer = smooth
+      method = 'HOULI'
     []
   []
 
