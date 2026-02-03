@@ -119,4 +119,14 @@
     compute_devices = 'cpu cuda mps'
     max_parallel = 1
   []
+
+  [phase_field_crystal_energy]
+    issues = '#133'
+    type = CSVDiff
+    input = pfc_fcc_energy.i
+    csvdiff = pfc_fcc_energy_out.csv
+    requirement = 'The system shall be able to compute the free energy for a phase-field crystal model'
+    compute_devices = 'cpu cuda mps'
+    max_parallel = 1
+  []
 []
