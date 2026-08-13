@@ -34,6 +34,8 @@ PairwiseAnisotropicGBEnergy::validParams()
       "dsigma_dgrad_grain2",
       "Output tensor buffer for the derivative of GB energy with respect to the right grain "
       "gradient.");
+  params.addRequiredParam<TensorOutputBufferName>(
+      "grad_gb", "Output tensor buffer for magnitude of the gradient denominator.");
   params.addRequiredParam<DataFileName>(
       "libtorch_model_file", "Path to the TorchScript file containing the GB energy model.");
   params.addRequiredParam<Real>("interface_width", "Coarsest interface width in model.");
@@ -46,6 +48,7 @@ PairwiseAnisotropicGBEnergy::PairwiseAnisotropicGBEnergy(const InputParameters &
     _grad_grain2(getInputBuffer("grad_grain2_buffer")),
     _dsigma_dgrain1(getOutputBufferByName(getParam<TensorOutputBufferName>("dsigma_dgrad_grain1"))),
     _dsigma_dgrain2(getOutputBufferByName(getParam<TensorOutputBufferName>("dsigma_dgrad_grain2"))),
+    _grad_gb(getOutputBufferByName(getParam<TensorOutputBufferName>("grad_gb"))),
     _file_path(Moose::DataFileUtils::getPath(getParam<DataFileName>("libtorch_model_file"))),
     _surrogate(std::make_unique<torch::jit::script::Module>(torch::jit::load(_file_path.path))),
     _interface_width(getParam<Real>("interface_width"))
@@ -54,7 +57,7 @@ PairwiseAnisotropicGBEnergy::PairwiseAnisotropicGBEnergy(const InputParameters &
   _surrogate->to(ref.device(), ref.scalar_type(), /* non_blocking = */ false);
   _surrogate->eval();
 
-  _gradient_threshold = 2 / (cosh(4) * cosh(4)) / _interface_width;
+  _gradient_threshold = 1 / (cosh(2) * cosh(2)) / _interface_width;
 }
 
 void
@@ -86,16 +89,10 @@ PairwiseAnisotropicGBEnergy::computeBuffer()
   torch::Tensor valid_idx;
   {
     torch::NoGradGuard no_grad;
-    auto grad_grain1_mag = torch::sqrt(
-        (grad_grain1_buffer * grad_grain1_buffer).sum(/*dim=*/1));
-    auto grad_grain2_mag = torch::sqrt(
-        (grad_grain2_buffer * grad_grain2_buffer).sum(/*dim=*/1));
-    auto valid_mask = (grad_grain1_mag >= _gradient_threshold) &
-                      (grad_grain2_mag >= _gradient_threshold);
-    // auto delta_grad = grad_grain1_buffer - grad_grain2_buffer;
-    // auto delta_grad_mag = torch::sqrt(
-    //     (delta_grad * delta_grad).sum(/*dim=*/1));
-    // auto valid_mask = delta_grad_mag >= _gradient_threshold;
+    auto grad_grain1_mag = torch::sqrt((grad_grain1_buffer * grad_grain1_buffer).sum(/*dim=*/1));
+    auto grad_grain2_mag = torch::sqrt((grad_grain2_buffer * grad_grain2_buffer).sum(/*dim=*/1));
+    auto valid_mask =
+        (grad_grain1_mag >= _gradient_threshold) & (grad_grain2_mag >= _gradient_threshold);
     valid_idx = torch::where(valid_mask)[0];
   }
   const auto N_interface = valid_idx.size(0);
@@ -108,16 +105,19 @@ PairwiseAnisotropicGBEnergy::computeBuffer()
   grad_grain2_buffer = torch::Tensor();
 
   // 3. Run model and autograd for valid interface points
-  torch::Tensor gamma_valid, dsigma_dgrad_grain1_valid, dsigma_dgrad_grain2_valid;
+  torch::Tensor gamma_valid, dsigma_dgrad_grain1_valid, dsigma_dgrad_grain2_valid,
+      delta_grad_mag_valid;
   if (N_interface > 0)
   {
     // Calculate n = (grad_gr1 - grad_gr2) / |(grad_gr1 - grad_gr2)|
     {
       auto delta_grad_valid = grad_grain1_valid - grad_grain2_valid;
-      auto delta_grad_mag_valid =
-          torch::sqrt((delta_grad_valid * delta_grad_valid).sum(/*dim=*/1, /*keepdim=*/true));
+      delta_grad_mag_valid = torch::linalg_norm(
+          delta_grad_valid, /*ord=*/2, /*dim=*/{1}, /*keepdim=*/true, /*dtype=*/c10::nullopt);
+      // auto n_hat = delta_grad_valid / (delta_grad_mag_valid);
+      auto n_hat = torch::nn::functional::normalize(
+          delta_grad_valid, torch::nn::functional::NormalizeFuncOptions().dim(1).eps(_gradient_threshold));
 
-      auto n_hat = delta_grad_valid / delta_grad_mag_valid;
       // grad_mag_valid and n_hat are released at end of this scope,
       // though the graph retains its own references until grad() is called
       gamma_valid = _surrogate->forward({n_hat}).toTensor().reshape({N_interface});
@@ -137,20 +137,26 @@ PairwiseAnisotropicGBEnergy::computeBuffer()
     grad_grain2_valid = torch::Tensor();
     gamma_valid = gamma_valid.detach();
   }
-
+  // After computing grads, before scattering
+  std::cout << "dsigma max: " << dsigma_dgrad_grain1_valid.abs().max().item<float>() << std::endl;
+  std::cout << "delta_grad_mag min (valid): " << delta_grad_mag_valid.min().item<float>() << std::endl;
+  std::cout << "N_interface: " << N_interface << std::endl;
   // 4. Scatter results into full-grid outputs
   auto gamma_full = torch::zeros({batch_size}, opts);
   auto dsigma_dgrad_grain1_full = torch::zeros({batch_size, 3}, opts);
   auto dsigma_dgrad_grain2_full = torch::zeros({batch_size, 3}, opts);
+  auto grad_mag_full = torch::zeros({batch_size}, opts);
 
   if (N_interface > 0)
   {
     gamma_full.index_put_({valid_idx}, gamma_valid);
     dsigma_dgrad_grain1_full.index_put_({valid_idx}, dsigma_dgrad_grain1_valid);
     dsigma_dgrad_grain2_full.index_put_({valid_idx}, dsigma_dgrad_grain2_valid);
+    grad_mag_full.index_put_({valid_idx}, delta_grad_mag_valid.squeeze());
   }
 
   _u = gamma_full.reshape(output_shape);
   _dsigma_dgrain1 = dsigma_dgrad_grain1_full.reshape(normal_shape);
   _dsigma_dgrain2 = dsigma_dgrad_grain2_full.reshape(normal_shape);
+  _grad_gb = grad_mag_full.reshape(output_shape);
 }

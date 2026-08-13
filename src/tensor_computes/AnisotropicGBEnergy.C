@@ -45,7 +45,7 @@ AnisotropicGBEnergy::AnisotropicGBEnergy(const InputParameters & parameters)
   _surrogate->to(ref.device(), ref.scalar_type(), /* non_blocking = */ false);
   _surrogate->eval();
 
-  _gradient_threshold = 2 / (cosh(4) * cosh(4)) / _interface_width;
+  _gradient_threshold = 2 / (cosh(2) * cosh(2)) / _interface_width;
 }
 
 void
@@ -86,7 +86,7 @@ AnisotropicGBEnergy::computeBuffer()
     // Recompute from the leaf so autograd differentiates through normalization
     auto grad_mag_valid = torch::sqrt(
         (gb_grad_valid * gb_grad_valid).sum(/*dim=*/1, /*keepdim=*/true)); // [N_interface, 1]
-
+    std::cout << torch::min(grad_mag_valid) << "and max is " << torch::max(grad_mag_valid) << std::endl;
     auto n_hat = gb_grad_valid / grad_mag_valid; // [N_interface, 3]
 
     auto gamma_valid = _surrogate->forward({n_hat}).toTensor().reshape({N_interface});

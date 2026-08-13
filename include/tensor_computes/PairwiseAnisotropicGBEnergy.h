@@ -30,6 +30,7 @@ protected:
   const torch::Tensor & _grad_grain2;
   torch::Tensor & _dsigma_dgrain1;
   torch::Tensor & _dsigma_dgrain2;
+  torch::Tensor & _grad_gb;
   Moose::DataFileUtils::Path _file_path;
 
   // forward() is not const-qualified
