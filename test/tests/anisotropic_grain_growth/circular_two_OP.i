@@ -1,7 +1,7 @@
 interface_width = 0.8
-r0 = 10
+r0 = 7.5
 
-gbe_max = '${units 1.3561 J/m^2}'
+gbe_max = '${units 0.8797226 J/m^2}'
 
 L = '${fparse 1.0 * 1.6 / ${interface_width} }'
 
@@ -17,13 +17,13 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
 
 [Domain]
   dim = 2
-  nx = 400
-  ny = 400
-  xmax = 40
-  ymax = 40
+  nx = 200
+  ny = 200
+  xmax = 20
+  ymax = 20
   mesh_mode = DUMMY
   device_names = 'cuda'
-  floating_precision = SINGLE
+  floating_precision = DOUBLE
 []
 
 [TensorComputes]
@@ -40,9 +40,9 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
             extra_symbols = 'true'
             expression = 'radius:=sqrt((x-${Domain/xmax}/2)^2+(y-${Domain/ymax}/2)^2);0.5 + 0.5*tanh(2*(radius-${r0})/${interface_width})'
         []
-        [kappa_linear_term]
+        [L_kappa_laplacian]
             type = ReciprocalLaplacianFactor
-            buffer = kappa_linear_term
+            buffer = L_kappa_laplacian
             factor = ${fparse ${L} * ${kappa} }
         []
         [kappa_laplacian]
@@ -73,13 +73,14 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
         [grad_gr0]
             type = GradientVector
             buffer = grad_gr0
-            input = gr0 #_bar
-            
+            input = gr0_bar
+            input_is_reciprocal = true            
         []
         [grad_gr1]
             type = GradientVector
             buffer = grad_gr1
-            input = gr1 #_bar
+            input = gr1_bar
+            input_is_reciprocal = true
         []
 
         # Get interface energy
@@ -88,13 +89,26 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
             buffer = 'sigma_gr0_gr1'
             dsigma_dgrad_grain1 = 'dsigma_gr0_gr1_dgrad_gr0'
             dsigma_dgrad_grain2 = 'dsigma_gr0_gr1_dgrad_gr1'
+            # grain1_buffer = 'gr0'
+            # grain2_buffer = 'gr1'
             grad_grain1_buffer = 'grad_gr0'
             grad_grain2_buffer = 'grad_gr1'
             interface_width = '${interface_width}'
-            grad_gb = grad_gb
-            libtorch_model_file = '/scratch/bhavcv/aniso_grain_growth/aniso_pfm_paper/sigma3_N_1e4.pt'
+            # grad_gb = grad_gb
+            libtorch_model_file = '/home/bhavcv/projects/torch-gb5dof/gb_energy_hull_2d.pt'
         []
-
+        [gamma_01]
+            type = ParsedCompute
+            buffer = 'gamma_01'
+            expression = 'g:=sigma_gr0_gr1/sqrt(${kappa}*${mu});${g_to_gamma_func}'
+            inputs = 'sigma_gr0_gr1'
+        []
+        [coeff_01]
+            type = ParsedCompute
+            buffer = 'coeff_01'
+            expression = 'g:=sigma_gr0_gr1/sqrt(${kappa}*${mu});${dgamma_dsigma} * gr0^2 *gr1^2'
+            inputs = 'sigma_gr0_gr1 gr0 gr1'
+        []
         [torque_01_gr0]
             type = AnisotropyTorque
             buffer = torque_01_gr0
@@ -109,17 +123,42 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
             g = 'coeff_01'
             input = 'gr1'
         []
+        [kappa_laplacian_gr0_hat]
+            type = ParsedCompute
+            buffer = kappa_laplacian_gr0_hat
+            inputs = 'gr0_bar kappa_laplacian'
+            expression = 'gr0_bar * kappa_laplacian'
+        []
+        [kappa_laplacian_gr1_hat]
+            type = ParsedCompute
+            buffer = kappa_laplacian_gr1_hat
+            inputs = 'gr1_bar kappa_laplacian'
+            expression = 'gr1_bar * kappa_laplacian'
+        []
+
+        [kappa_laplacian_gr0]
+            type = InverseFFT
+            buffer = kappa_laplacian_gr0
+            input = kappa_laplacian_gr0_hat
+        []
+        [kappa_laplacian_gr1]
+            type = InverseFFT
+            buffer = kappa_laplacian_gr1
+            input = kappa_laplacian_gr1_hat
+        []
+
+
         [gr0_bulk_term]
             type = ParsedCompute
             buffer = 'gr0_bulk_term'
-            expression = '-${L}*${mu} * (gr0^3 - gr0 + 2*gr0*(gamma_01*gr1^2) - torque_01_gr0 )'
-            inputs = 'gr0 gr1 gamma_01 torque_01_gr0'
+            expression = 'L_NL:=${L}*(sigma_gr0_gr1)/${gbe_max};-L_NL*${mu} * (gr0^3 - gr0 + 2*gr0*(gamma_01*gr1^2) - torque_01_gr0) + (L_NL - ${L})*kappa_laplacian_gr0'
+            inputs = 'gr0 gr1 gamma_01 torque_01_gr0 sigma_gr0_gr1 kappa_laplacian_gr0'
         []
         [gr1_bulk_term]
             type = ParsedCompute
             buffer = 'gr1_bulk_term'
-            expression = '-${L}*${mu} * (gr1^3 - gr1 + 2*gr1*(gamma_01*gr0^2) - torque_01_gr1)'
-            inputs = 'gr0 gr1 gamma_01 torque_01_gr1'
+            expression = 'L_NL:=${L}*(sigma_gr0_gr1)/${gbe_max};-L_NL*${mu} * (gr1^3 - gr1 + 2*gr1*(gamma_01*gr0^2) - torque_01_gr1) + (L_NL - ${L})*kappa_laplacian_gr1'
+            inputs = 'gr0 gr1 gamma_01 torque_01_gr1 sigma_gr0_gr1 kappa_laplacian_gr1'
         []
 
 
@@ -158,19 +197,56 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
             type = ParsedCompute
             buffer = 'total_energy'
             expression = '${mu} * (${f0}) + kappa_laplacian_gr_i'
-            inputs = 'gr0 gr1 gr2 gamma_01 kappa_laplacian_gr_i'
+            inputs = 'gr0 gr1 gamma_01 kappa_laplacian_gr_i'
         []
-        [kappa_laplacian_gr_i_bar]
+        [gr0x]
+            type = FFTGradient
+            buffer = gr0x
+            input = gr0_bar
+            direction = x
+            input_is_reciprocal = true
+        []
+        [gr0y]
+            type = FFTGradient
+            buffer = gr0y
+            input = gr0_bar
+            direction = y
+            input_is_reciprocal = true
+        []
+        [gr0z]
+            type = FFTGradient
+            buffer = gr0z
+            input = gr0_bar
+            direction = z
+            input_is_reciprocal = true
+        []
+        [gr1x]
+            type = FFTGradient
+            buffer = gr1x
+            input = gr1_bar
+            direction = x
+            input_is_reciprocal = true
+        []
+        [gr1y]
+            type = FFTGradient
+            buffer = gr1y
+            input = gr1_bar
+            direction = y
+            input_is_reciprocal = true
+        []
+        [gr1z]
+            type = FFTGradient
+            buffer = gr1z
+            input = gr1_bar
+            direction = z
+            input_is_reciprocal = true
+        []
+
+        [kappa_laplacian_gr_i]
             type = ParsedCompute
             buffer = kappa_laplacian_gr_i
-            expression = 'kappa_laplacian * (gr0_bar + gr1_bar)'
-            inputs = 'gr0_bar gr1_bar kappa_laplacian'
-            extra_symbols = true
-        []
-        [kappa_laplacian_gr_i]
-            type = InverseFFT
-            buffer = kappa_laplacian_gr_i
-            input = kappa_laplacian_gr_i_bar            
+            expression = '0.5 * ${kappa} * (gr0x^2 + gr0y^2 + gr0z^2 + gr1x^2 + gr1y^2 + gr1z^2)'
+            inputs = 'gr0x gr0y gr0z gr1x gr1y gr1z'
         []
     []
 []
@@ -193,7 +269,7 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
     reciprocal_buffer = 'gr0_bar gr1_bar'
     linear_reciprocal = 'L_kappa_laplacian L_kappa_laplacian'
     nonlinear_reciprocal = 'NL_gr0_smooth NL_gr1_smooth'
-    substeps = 1000
+    substeps = 10000
     predictor_order = 1
     corrector_order = 1
     corrector_steps = 1
@@ -202,8 +278,8 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
 [TensorOutputs]
     [xdmf]
         type = XDMFTensorOutput
-        buffer = 'gr0 gr1 sigma total_energy'
-        output_mode = 'NODE NODE NODE NODE'
+        buffer = 'gr0 gr1 sigma_gr0_gr1 sigma total_energy'# grad_gb'
+        output_mode = 'NODE NODE NODE NODE NODE'# NODE'
         enable_hdf5 = true
         transpose = false
     []
@@ -211,8 +287,8 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
 
 [Executioner]
     type = Transient
-    dt = 0.1
-    num_steps = 20
+    dt = 1
+    num_steps = 100
 []
 
 [Outputs]

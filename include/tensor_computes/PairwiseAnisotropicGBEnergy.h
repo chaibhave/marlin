@@ -30,7 +30,6 @@ protected:
   const torch::Tensor & _grad_grain2;
   torch::Tensor & _dsigma_dgrain1;
   torch::Tensor & _dsigma_dgrain2;
-  torch::Tensor & _grad_gb;
   Moose::DataFileUtils::Path _file_path;
 
   // forward() is not const-qualified
@@ -38,4 +37,7 @@ protected:
 
   const Real _interface_width;
   Real _gradient_threshold;
+
+  /// Maximum number of spatial points evaluated in a single chunk
+  const unsigned int _chunk_size;
 };

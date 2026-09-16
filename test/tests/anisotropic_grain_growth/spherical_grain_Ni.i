@@ -1,11 +1,8 @@
 interface_width = 1.6 #0.8
 r0 = 7.5
 
-# # Ni
-# gbe_max = '${units 0.8797226 J/m^2}'
-
-#UO2 
-gbe_max = '${units 1.7341618537902832 J/m^2}'
+# Ni
+gbe_max = '${units 0.8797226 J/m^2}'
 
 L = '${fparse 1.0 * 1.6 / ${interface_width} }'
 
@@ -111,7 +108,7 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
             grad_grain1_buffer = 'grad_gr0'
             grad_grain2_buffer = 'grad_gr1'
             interface_width = '${interface_width}'
-            libtorch_model_file = '/home/bhavcv/projects/torch-gb5dof/R1_R3.pt' #'/home/bhavcv/projects/torch-gb5dof/gb_energy_hull_3d.pt'
+            libtorch_model_file = '/home/bhavcv/projects/torch-gb5dof/Ni_R1_R3.pt' #'/home/bhavcv/projects/torch-gb5dof/gb_energy_hull_3d.pt'
             chunk_size = 1e5
         []
         [gamma_01]
@@ -286,7 +283,7 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
     reciprocal_buffer = 'gr0_bar gr1_bar'
     linear_reciprocal = 'L_kappa_laplacian L_kappa_laplacian'
     nonlinear_reciprocal = 'NL_gr0_smooth NL_gr1_smooth'
-    substeps = 5000 #0
+    substeps = 100 #0
     predictor_order = 2
     corrector_order = 1
     corrector_steps = 2
@@ -305,7 +302,7 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
 [Executioner]
     type = Transient
     dt = 0.1
-    num_steps = 30 #200
+    num_steps = 200
 []
 
 [Outputs]

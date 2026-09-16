@@ -1,11 +1,11 @@
 interface_width = 1.6
 
-gbe_max = '${units 1.3561 J/m^2}'
-L = 1
+gbe_max = '${units 1.24 J/m^2}'
+L = '${fparse 1.0 * 1.6 / ${interface_width} }'
 
 left = '(0.5-0.5*tanh(2*(x-20)/${interface_width}))'
-c1 = 'inside:=sqrt((x-16)^2+(y-20)^2+(z-20)^2)-7;(0.5-0.5*tanh(2*inside/${interface_width}))*${left}'
-c2 = 'inside:=sqrt((x-24)^2+(y-20)^2+(z-20)^2)-7;(0.5-0.5*tanh(2*inside/${interface_width}))*(1-${left})'
+c1 = 'inside:=sqrt((x-16)^2+(y-20)^2+(z-20)^2)-10;(0.5-0.5*tanh(2*inside/${interface_width}))*${left}'
+c2 = 'inside:=sqrt((x-24)^2+(y-20)^2+(z-20)^2)-10;(0.5-0.5*tanh(2*inside/${interface_width}))*(1-${left})'
 
 g_gamma0 = '${fparse sqrt(2) / 3 }' # g(gamma=1.5)
 f0_gamma0 = 0.1411
@@ -27,8 +27,8 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + (gr2^4/4 - gr2^2/2) + gamma_0
     ymax = 40
     zmax = 40
     mesh_mode = DUMMY
-    device_names = 'mps'
-    floating_precision = SINGLE
+    device_names = 'cuda'
+    floating_precision = DOUBLE
 []
 
 [TensorComputes]
@@ -56,6 +56,11 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + (gr2^4/4 - gr2^2/2) + gamma_0
             buffer = 'L_kappa_laplacian'
             factor = '${fparse ${L} * ${kappa}}'
         []
+        [kappa_laplacian]
+            type = ReciprocalLaplacianFactor
+            buffer = kappa_laplacian
+            factor = '${kappa}'
+        []
         [smooth]
             type = DeAliasingTensor
             method = HOULI
@@ -63,20 +68,59 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + (gr2^4/4 - gr2^2/2) + gamma_0
         []
     []
     [Solve]
+        ## FFT
+        [gr0_bar]
+            type = ForwardFFT
+            buffer = gr0_bar
+            input = gr0
+        []
+        [gr1_bar]
+            type = ForwardFFT
+            buffer = gr1_bar
+            input = gr1
+        []
+        [gr2_bar]
+            type = ForwardFFT
+            buffer = gr2_bar
+            input = gr2
+        []
+
+        # [gr0_bar_smooth]
+        #     type = ParsedCompute
+        #     buffer = gr0_bar_smooth
+        #     expression = 'gr0_bar * smooth'
+        #     inputs = 'gr0_bar smooth'
+        # []
+        # [gr1_bar_smooth]
+        #     type = ParsedCompute
+        #     buffer = gr1_bar_smooth
+        #     expression = 'gr1_bar * smooth'
+        #     inputs = 'gr1_bar smooth'
+        # []
+        # [gr2_bar_smooth]
+        #     type = ParsedCompute
+        #     buffer = gr2_bar_smooth
+        #     expression = 'gr2_bar * smooth'
+        #     inputs = 'gr2_bar smooth'
+        # []
+
         [grad_gr0]
             type = GradientVector
             buffer = grad_gr0
-            input = gr0
+            input = gr0 #_smooth
+            # input_is_reciprocal = true  
         []
         [grad_gr1]
             type = GradientVector
             buffer = grad_gr1
-            input = gr1
+            input = gr1#_smooth
+            # input_is_reciprocal = true  
         []
         [grad_gr2]
             type = GradientVector
             buffer = grad_gr2
-            input = gr2
+            input = gr2 #_smooth
+            # input_is_reciprocal = true  
         []
 
         [sigma_gr0_gr1]
@@ -87,7 +131,8 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + (gr2^4/4 - gr2^2/2) + gamma_0
             grad_grain1_buffer = 'grad_gr0'
             grad_grain2_buffer = 'grad_gr1'
             interface_width = '${interface_width}'
-            libtorch_model_file = '/Users/bhavcv/projects/torch-gb5dof/R1_R2.pt'
+            libtorch_model_file = '/home/bhavcv/projects/torch-gb5dof/R1_R2.pt'
+            chunk_size = 1e6
         []
         [sigma_gr1_gr2]
             type = PairwiseAnisotropicGBEnergy
@@ -97,7 +142,8 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + (gr2^4/4 - gr2^2/2) + gamma_0
             grad_grain1_buffer = 'grad_gr1'
             grad_grain2_buffer = 'grad_gr2'
             interface_width = '${interface_width}'
-            libtorch_model_file = '/Users/bhavcv/projects/torch-gb5dof/R2_R3.pt'
+            libtorch_model_file = '/home/bhavcv/projects/torch-gb5dof/R2_R3.pt'
+            chunk_size = 1e6
         []
         [sigma_gr0_gr2]
             type = PairwiseAnisotropicGBEnergy
@@ -107,7 +153,8 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + (gr2^4/4 - gr2^2/2) + gamma_0
             grad_grain1_buffer = 'grad_gr0'
             grad_grain2_buffer = 'grad_gr2'
             interface_width = '${interface_width}'
-            libtorch_model_file = '/Users/bhavcv/projects/torch-gb5dof/R1_R3.pt'
+            libtorch_model_file = '/home/bhavcv/projects/torch-gb5dof/R1_R3.pt'
+            chunk_size = 1e6
         []
 
         [gamma_01]
@@ -191,42 +238,72 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + (gr2^4/4 - gr2^2/2) + gamma_0
             input = 'gr2'
         []
 
+        [sigma]
+            type = ParsedCompute
+            buffer = 'sigma'
+            expression = '(gr0^2*gr1^2*sigma_gr0_gr1 + gr1^2*gr2^2*sigma_gr1_gr2 + gr0^2*gr2^2*sigma_gr0_gr2)/(gr0^2*gr1^2 + gr1^2*gr2^2 + gr0^2*gr2^2 + 1e-6)'
+            inputs = 'sigma_gr0_gr1 sigma_gr0_gr2 sigma_gr1_gr2 gr0 gr1 gr2'
+        []
+        [L_NL]
+            type = ParsedCompute
+            buffer = 'L_NL'
+            expression = '${L} * sigma / ${gbe_max}'
+            inputs = 'sigma'
+        []
+
+        [kappa_laplacian_gr0_hat]
+            type = ParsedCompute
+            buffer = kappa_laplacian_gr0_hat
+            inputs = 'gr0_bar kappa_laplacian'
+            expression = 'gr0_bar * kappa_laplacian'
+        []
+        [kappa_laplacian_gr1_hat]
+            type = ParsedCompute
+            buffer = kappa_laplacian_gr1_hat
+            inputs = 'gr1_bar kappa_laplacian'
+            expression = 'gr1_bar * kappa_laplacian'
+        []
+        [kappa_laplacian_gr2_hat]
+            type = ParsedCompute
+            buffer = kappa_laplacian_gr2_hat
+            inputs = 'gr2_bar kappa_laplacian'
+            expression = 'gr2_bar * kappa_laplacian'
+        []
+
+        [kappa_laplacian_gr0]
+            type = InverseFFT
+            buffer = kappa_laplacian_gr0
+            input = kappa_laplacian_gr0_hat
+        []
+        [kappa_laplacian_gr1]
+            type = InverseFFT
+            buffer = kappa_laplacian_gr1
+            input = kappa_laplacian_gr1_hat
+        []
+        [kappa_laplacian_gr2]
+            type = InverseFFT
+            buffer = kappa_laplacian_gr2
+            input = kappa_laplacian_gr2_hat
+        []
+
         [gr0_bulk_term]
             type = ParsedCompute
             buffer = 'gr0_bulk_term'
-            expression = '-${L}*${mu} * (gr0^3 - gr0 + 2*gr0*(gamma_01*gr1^2 + gamma_02*gr2^2) - torque_01_gr0 - torque_02_gr0)'
-            inputs = 'gr0 gr1 gr2 gamma_01 gamma_02 torque_01_gr0 torque_02_gr0'
+            expression = '-L_NL*${mu} * (gr0^3 - gr0 + 2*gr0*(gamma_01*gr1^2 + gamma_02*gr2^2) - torque_01_gr0 - torque_02_gr0) + (L_NL - ${L}) * kappa_laplacian_gr0'
+            inputs = 'gr0 gr1 gr2 gamma_01 gamma_02 torque_01_gr0 torque_02_gr0 L_NL kappa_laplacian_gr0'
         []
         [gr1_bulk_term]
             type = ParsedCompute
             buffer = 'gr1_bulk_term'
-            expression = '-${L}*${mu} * (gr1^3 - gr1 + 2*gr1*(gamma_01*gr0^2 + gamma_12*gr2^2) - torque_01_gr1 - torque_12_gr1)'
-            inputs = 'gr0 gr1 gr2 gamma_01 gamma_12 torque_01_gr1 torque_12_gr1'
+            expression = '-L_NL*${mu} * (gr1^3 - gr1 + 2*gr1*(gamma_01*gr0^2 + gamma_12*gr2^2) - torque_01_gr1 - torque_12_gr1) + (L_NL - ${L}) * kappa_laplacian_gr1'
+            inputs = 'gr0 gr1 gr2 gamma_01 gamma_12 torque_01_gr1 torque_12_gr1 L_NL kappa_laplacian_gr1'
         []
         [gr2_bulk_term]
             type = ParsedCompute
             buffer = 'gr2_bulk_term'
-            expression = '-${L}*${mu} * (gr2^3 - gr2 + 2*gr2*(gamma_02*gr0^2 + gamma_12*gr1^2) - torque_02_gr2 - torque_12_gr2)'
-            inputs = 'gr0 gr1 gr2 gamma_02 gamma_12 torque_02_gr2 torque_12_gr2'
+            expression = '-L_NL*${mu} * (gr2^3 - gr2 + 2*gr2*(gamma_02*gr0^2 + gamma_12*gr1^2) - torque_02_gr2 - torque_12_gr2) + (L_NL - ${L}) * kappa_laplacian_gr2'
+            inputs = 'gr0 gr1 gr2 gamma_02 gamma_12 torque_02_gr2 torque_12_gr2 L_NL kappa_laplacian_gr2'
         []
-
-        ## FFT
-        [gr0_bar]
-            type = ForwardFFT
-            buffer = gr0_bar
-            input = gr0
-        []
-        [gr1_bar]
-            type = ForwardFFT
-            buffer = gr1_bar
-            input = gr1
-        []
-        [gr2_bar]
-            type = ForwardFFT
-            buffer = gr2_bar
-            input = gr2
-        []
-
         [NL_gr0]
             type = ForwardFFT
             buffer = NL_gr0
@@ -262,12 +339,6 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + (gr2^4/4 - gr2^2/2) + gamma_0
         []
 
         # Properties for output
-        [sigma]
-            type = ParsedCompute
-            buffer = 'sigma'
-            expression = '(gr0^2*gr1^2*sigma_gr0_gr1 + gr1^2*gr2^2*sigma_gr1_gr2 + gr0^2*gr2^2*sigma_gr0_gr2)/(gr0^2*gr1^2 + gr1^2*gr2^2 + gr0^2*gr2^2 + 1e-3)'
-            inputs = 'sigma_gr0_gr1 sigma_gr0_gr2 sigma_gr1_gr2 gr0 gr1 gr2'
-        []
         [total_energy]
             type = ParsedCompute
             buffer = 'total_energy'
@@ -301,7 +372,7 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + (gr2^4/4 - gr2^2/2) + gamma_0
     reciprocal_buffer = 'gr0_bar gr1_bar gr2_bar'
     linear_reciprocal = 'L_kappa_laplacian L_kappa_laplacian L_kappa_laplacian'
     nonlinear_reciprocal = 'NL_gr0_smooth NL_gr1_smooth NL_gr2_smooth'
-    substeps = 10
+    substeps = 500 #00
     predictor_order = 1
     corrector_order = 1
     corrector_steps = 1
@@ -319,8 +390,8 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + (gr2^4/4 - gr2^2/2) + gamma_0
 
 [Executioner]
     type = Transient
-    dt = 0.1
-    num_steps = 50
+    dt = 1
+    num_steps = 10
 []
 
 [Outputs]
