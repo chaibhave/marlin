@@ -35,4 +35,7 @@ protected:
 
   const Real _interface_width;
   Real _gradient_threshold;
+
+  /// Maximum number of spatial points evaluated in a single chunk
+  const unsigned int _chunk_size;
 };

@@ -1,4 +1,4 @@
-interface_width = 0.8
+interface_width = 2.0
 r0 = 3
 
 gbe_max = '${units 0.8797226 J/m^2}'
@@ -91,6 +91,7 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
       grad_grain2_buffer = 'grad_gr1'
       interface_width = '${interface_width}'
       libtorch_model_file = 'marlin:anisotropic_gb_energy/gb_energy_hull_2d.pt'
+      chunk_size = 256
     []
     [gamma_01]
       type = ParsedCompute

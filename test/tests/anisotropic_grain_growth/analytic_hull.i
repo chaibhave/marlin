@@ -48,6 +48,7 @@ g_eta_expr = '(eta^2*(1-eta^2)^2)'
       dsigma_dn = dsigma_dn
       libtorch_model_file = 'marlin:anisotropic_gb_energy/analytic_sigma.pt'
       interface_width = ${interface_width}
+      chunk_size = 256
     []
     [bulk_driving_force]
       type = ParsedCompute
