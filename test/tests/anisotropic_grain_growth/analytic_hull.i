@@ -14,6 +14,7 @@ g_eta_expr = '(eta^2*(1-eta^2)^2)'
   xmax = 16
   ymax = 16
   mesh_mode = DUMMY
+  floating_precision = SINGLE
 []
 
 [TensorComputes]

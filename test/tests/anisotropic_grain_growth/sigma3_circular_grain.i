@@ -22,6 +22,7 @@ f0 = '((gr0^4/4 - gr0^2/2) + (gr1^4/4 - gr1^2/2) + gamma_01*gr0^2*gr1^2 + 0.25)'
   xmax = 8
   ymax = 8
   mesh_mode = DUMMY
+  floating_precision = SINGLE
 []
 
 [TensorComputes]
