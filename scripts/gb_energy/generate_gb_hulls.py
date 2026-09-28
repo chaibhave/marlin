@@ -34,33 +34,24 @@ import numpy as np
 system = "Ni"
 
 # Number of GB5DOF evaluations used to construct the reciprocal-space hull.
-num_samples = int(1e4)
-
-# Number of directions used only to determine how important each hull facet is.
-# These are cheap because GB5DOF is NOT evaluated for them.
-num_probe_normals = int(1e4)
+num_samples = int(1e5)
 
 chunk_size = int(1e3)
-probe_chunk_size = int(2e3)
 
 dim = 3
 device = "cpu"
 dtype = torch.float64
 
-beta = 50.0
+beta = 100.0
 
-# Remove facets whose active region occupies less than this fraction
-# of orientation space.
-#
-# 1e-4 means a facet must control at least ~0.01% of sampled directions.
-min_active_fraction = 1.0e-4
+# Qhull post-merging: merge facets whose centrum lies within this absolute
+# distance (in reciprocal-energy space) of a neighboring facet plane. Keeps
+# only planes distinguishable at this resolution, bounding the relative
+# energy error at roughly this value while cutting the facet count by
+# orders of magnitude.
+qhull_merge_tolerance = 1.0e-3
 
-# Merge hull planes that are effectively the same plane.
-#
-# These are deliberately fairly tight. Increase them gradually if the
-# reconstructed Wulff shape still contains lots of tiny geometric features.
-plane_angle_tol_deg = 0.25
-plane_distance_rel_tol = 2.0e-3
+qhull_options = f"C-{qhull_merge_tolerance} Qc"
 
 
 # =============================================================================
@@ -258,243 +249,6 @@ def normalize_equations(equations):
 
 
 # =============================================================================
-# Merge almost-identical planes
-# =============================================================================
-
-def merge_nearly_identical_planes(
-    equations,
-    angle_tol_deg=0.25,
-    distance_rel_tol=2e-3,
-):
-    """
-    Merge hull planes having nearly identical orientation and distance from
-    the origin.
-
-    These usually arise from numerical sampling of what should physically be
-    one crystallographic plane.
-    """
-    eq_np = equations.detach().cpu().numpy()
-
-    normals = eq_np[:, :dim]
-    distances = -eq_np[:, dim]
-
-    angle_cos_tol = np.cos(
-        np.deg2rad(angle_tol_deg)
-    )
-
-    used = np.zeros(
-        len(eq_np),
-        dtype=bool,
-    )
-
-    merged = []
-    cluster_sizes = []
-
-    for i in range(len(eq_np)):
-
-        if used[i]:
-            continue
-
-        ni = normals[i]
-        hi = distances[i]
-
-        dots = normals @ ni
-
-        rel_dist = np.abs(
-            distances - hi
-        ) / max(abs(hi), 1e-15)
-
-        members = (
-            (~used)
-            & (dots >= angle_cos_tol)
-            & (rel_dist <= distance_rel_tol)
-        )
-
-        inds = np.where(members)[0]
-
-        cluster_normals = normals[inds]
-        cluster_distances = distances[inds]
-
-        # Average the plane normal, then renormalize.
-        n_mean = cluster_normals.mean(axis=0)
-        n_mean /= np.linalg.norm(n_mean)
-
-        # Average plane distance from origin.
-        h_mean = cluster_distances.mean()
-
-        merged.append(
-            np.concatenate(
-                [
-                    n_mean,
-                    [-h_mean],
-                ]
-            )
-        )
-
-        cluster_sizes.append(len(inds))
-
-        used[inds] = True
-
-    merged = np.asarray(
-        merged,
-        dtype=np.float64,
-    )
-
-    print(
-        f"Near-plane merge: "
-        f"{len(eq_np)} -> {len(merged)} planes"
-    )
-
-    if cluster_sizes:
-        print(
-            f"Largest merged plane cluster: "
-            f"{max(cluster_sizes)}"
-        )
-
-    return torch.tensor(
-        merged,
-        dtype=equations.dtype,
-        device=equations.device,
-    )
-
-
-# =============================================================================
-# Find which facets actually control the energy
-# =============================================================================
-
-@torch.no_grad()
-def measure_facet_activity(
-    equations,
-    num_normals,
-):
-    """
-    Measure the fraction of orientation space controlled by each hull plane.
-
-    For
-
-        a_i . x + d_i = 0
-
-    the radial intersection along unit n is
-
-        r_i = -d_i / (a_i . n)
-
-    and therefore the candidate energy is
-
-        gamma_i(n) = (a_i . n) / (-d_i).
-
-    The convex energy is the maximum of these candidates.
-    """
-    probe_normals = fibonacci_sphere(
-        num_normals,
-        device=device,
-        dtype=dtype,
-    )
-
-    coeffs = equations[:, :dim]
-    offsets = equations[:, dim]
-
-    n_facets = equations.shape[0]
-
-    counts = torch.zeros(
-        n_facets,
-        dtype=torch.int64,
-        device=device,
-    )
-
-    for start in range(
-        0,
-        num_normals,
-        probe_chunk_size,
-    ):
-        end = min(
-            start + probe_chunk_size,
-            num_normals,
-        )
-
-        n = probe_normals[start:end, :dim]
-
-        denom = n @ coeffs.T
-
-        candidate_energy = (
-            denom / (-offsets[None, :])
-        )
-
-        # A plane whose outward normal points away from n cannot provide the
-        # positive radial intersection in that direction.
-        candidate_energy = candidate_energy.masked_fill(
-            denom <= 0.0,
-            -torch.inf,
-        )
-
-        active = candidate_energy.argmax(
-            dim=1
-        )
-
-        counts += torch.bincount(
-            active,
-            minlength=n_facets,
-        )
-
-    fractions = (
-        counts.to(dtype)
-        / float(num_normals)
-    )
-
-    return counts, fractions
-
-
-# =============================================================================
-# Remove facets with negligible solid-angle support
-# =============================================================================
-
-def prune_small_facets(
-    equations,
-    min_fraction,
-):
-    counts, fractions = measure_facet_activity(
-        equations,
-        num_probe_normals,
-    )
-
-    keep = fractions >= min_fraction
-
-    # Always retain at least facets that were seen once. This fallback prevents
-    # pathological settings of min_fraction from destroying the hull.
-    if keep.sum() < 4:
-        keep = counts > 0
-
-    kept_equations = equations[keep]
-
-    kept_fractions = fractions[keep]
-
-    order = torch.argsort(
-        kept_fractions,
-        descending=True,
-    )
-
-    kept_equations = kept_equations[order]
-    kept_fractions = kept_fractions[order]
-
-    print(
-        f"Solid-angle pruning: "
-        f"{len(equations)} -> "
-        f"{len(kept_equations)} planes"
-    )
-
-    print(
-        f"Smallest retained active fraction: "
-        f"{kept_fractions.min().item():.6e}"
-    )
-
-    print(
-        f"Largest active fraction: "
-        f"{kept_fractions.max().item():.6e}"
-    )
-
-    return kept_equations
-
-
-# =============================================================================
 # Build one pair
 # =============================================================================
 
@@ -520,15 +274,20 @@ def build_hull_model(
     )
 
     print(
-        "Done sampling. Building raw convex hull..."
+        "Done sampling. Building merged convex hull..."
     )
 
+    # -------------------------------------------------------------------------
+    # Convex hull with Qhull post-merging of near-coplanar facets
+    # -------------------------------------------------------------------------
+
     hull = ConvexHull(
-        pts
+        pts,
+        qhull_options=qhull_options,
     )
 
     print(
-        f"Raw Qhull facets: "
+        f"Qhull facets ({qhull_options}): "
         f"{len(hull.equations)}"
     )
 
@@ -540,30 +299,6 @@ def build_hull_model(
 
     equations = normalize_equations(
         equations
-    )
-
-    # -------------------------------------------------------------------------
-    # 1. Remove numerically redundant near-identical planes
-    # -------------------------------------------------------------------------
-
-    equations = merge_nearly_identical_planes(
-        equations,
-        angle_tol_deg=plane_angle_tol_deg,
-        distance_rel_tol=plane_distance_rel_tol,
-    )
-
-    # -------------------------------------------------------------------------
-    # 2. Remove planes active only over negligible solid angle
-    # -------------------------------------------------------------------------
-
-    equations = prune_small_facets(
-        equations,
-        min_fraction=min_active_fraction,
-    )
-
-    print(
-        f"Final hull plane count: "
-        f"{len(equations)}"
     )
 
     # -------------------------------------------------------------------------

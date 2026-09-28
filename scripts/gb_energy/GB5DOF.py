@@ -36,7 +36,7 @@ class GB5DOF(nn.Module):
         self._device = device
 
         # Reused constants
-        self.dismax = 0.9999
+        self.dismax = 0.999999
 
         self.register_buffer("_half", torch.tensor(0.5, dtype=self.dtype))
         self.register_buffer("_zero", torch.tensor(0.0, dtype=self.dtype))
@@ -47,7 +47,8 @@ class GB5DOF(nn.Module):
             "_th5_100", torch.acos(torch.tensor(3 / 5, dtype=self.dtype))
         )
         self.register_buffer(
-            "_th6_100", 2 * torch.acos(torch.tensor(5 / 34**0.5, dtype=self.dtype))
+            "_th6_100", 2 *
+            torch.acos(torch.tensor(5 / 34**0.5, dtype=self.dtype))
         )
         self.register_buffer(
             "_th3_110", torch.acos(torch.tensor(1 / 3, dtype=self.dtype))
@@ -61,11 +62,14 @@ class GB5DOF(nn.Module):
         self.register_buffer("_offset", torch.tensor(1e-5, dtype=self.dtype))
 
         # ── Material parameters ──────────────────────────────────────────
-        par43 = self._make_parvec(system, dtype=self.dtype, device=self._device)
+        par43 = self._make_parvec(
+            system, dtype=self.dtype, device=self._device)
         self.register_buffer("par43", par43)
 
-        sqrt_2 = torch.sqrt(torch.tensor(2.0, dtype=self.dtype, device=self._device))
-        sqrt_3 = torch.sqrt(torch.tensor(3.0, dtype=self.dtype, device=self._device))
+        sqrt_2 = torch.sqrt(torch.tensor(
+            2.0, dtype=self.dtype, device=self._device))
+        sqrt_3 = torch.sqrt(torch.tensor(
+            3.0, dtype=self.dtype, device=self._device))
 
         # ── Axis sets ────────────────────────────────────────────────────
         self.register_buffer(
@@ -84,7 +88,8 @@ class GB5DOF(nn.Module):
         self.register_buffer(
             "axes_110",
             torch.tensor(
-                [[1, 1, 0], [1, -1, 0], [1, 0, 1], [1, 0, -1], [0, 1, 1], [0, 1, -1]],
+                [[1, 1, 0], [1, -1, 0], [1, 0, 1],
+                    [1, 0, -1], [0, 1, 1], [0, 1, -1]],
                 dtype=self.dtype,
                 device=self._device,
             )
@@ -206,9 +211,12 @@ class GB5DOF(nn.Module):
         valid110 = geom_110[4]
         valid111 = geom_111[4]
 
-        e100 = torch.where(valid100, self._set100(geom_100), torch.zeros_like(d100))
-        e110 = torch.where(valid110, self._set110(geom_110), torch.zeros_like(d110))
-        e111 = torch.where(valid111, self._set111(geom_111), torch.zeros_like(d111))
+        e100 = torch.where(valid100, self._set100(
+            geom_100), torch.zeros_like(d100))
+        e110 = torch.where(valid110, self._set110(
+            geom_110), torch.zeros_like(d110))
+        e111 = torch.where(valid111, self._set111(
+            geom_111), torch.zeros_like(d111))
 
         s100 = torch.where(
             d100 > d0100,
@@ -351,7 +359,8 @@ class GB5DOF(nn.Module):
                 torch.where(
                     ksi <= th4,
                     f3,
-                    torch.where(ksi <= th5, f4, torch.where(ksi <= th6, f5, f6)),
+                    torch.where(ksi <= th5, f4, torch.where(
+                        ksi <= th6, f5, f6)),
                 ),
             ),
         )
@@ -373,13 +382,15 @@ class GB5DOF(nn.Module):
 
         period = torch.pi  # the twist period
 
-        th_unthreshed = torch.remainder(torch.abs(ksi), period)  # rotation symmetry
+        th_unthreshed = torch.remainder(
+            torch.abs(ksi), period)  # rotation symmetry
         th = torch.where(
             th_unthreshed > period / 2, period - th_unthreshed, th_unthreshed
         )
 
         f1 = en1 * self._rsw(
-            th, torch.tensor(0, dtype=self.dtype, device=self._device), th1, a01
+            th, torch.tensor(0, dtype=self.dtype,
+                             device=self._device), th1, a01
         )
         f2 = en2 + (en1 - en2) * self._rsw(th, th2, th1, a12)
         f3 = en3 + (en2 - en3) * self._rsw(th, th3, th2, a23)
@@ -399,11 +410,13 @@ class GB5DOF(nn.Module):
         en2 = self._stgbs110(period - ksi)
 
         select = en1 >= en2
-
-        rsw_eta = self._rsw(eta, self._zero, torch.pi, a)
+        rsw_forward = self._rsw(eta, self._zero, torch.pi, a)
+        rsw_reverse = self._rsw(eta, torch.pi, self._zero, a)
 
         en = torch.where(
-            select, en2 + (en1 - en2) * rsw_eta, en1 + (en2 - en1) * rsw_eta
+            select,
+            en2 + (en1 - en2) * rsw_reverse,
+            en1 + (en2 - en1) * rsw_forward,
         )
         return en
 
@@ -511,7 +524,8 @@ class GB5DOF(nn.Module):
         select = ksi_sym <= ksim
 
         f1 = enmax * self._rsw(
-            ksi_sym, torch.tensor(0, dtype=self.dtype, device=self._device), ksim, a1
+            ksi_sym, torch.tensor(0, dtype=self.dtype,
+                                  device=self._device), ksim, a1
         )
         chi = enmin + (encnt - enmin) * self._rsw(
             eta_sym.clamp(max=torch.pi / (2 * etascale)),
@@ -630,7 +644,8 @@ class GB5DOF(nn.Module):
         )
 
         psi_half = psi[:, :, None] / 2.0
-        theta = 2.0 * torch.atan2(dotp * torch.sin(psi_half), torch.cos(psi_half))
+        theta = 2.0 * \
+            torch.atan2(dotp * torch.sin(psi_half), torch.cos(psi_half))
 
         # Compute the normal of the best-fitting GB in grain 1
         n1 = P[:, 0, :]  # [N,3]
@@ -700,10 +715,12 @@ class GB5DOF(nn.Module):
         theta1 = theta1 - torch.round(theta1 / period) * period
 
         theta2 += torch.where(
-            torch.abs(theta2 + period / 2) < 1e-6, period, torch.zeros_like(theta2)
+            torch.abs(theta2 + period /
+                      2) < 1e-6, period, torch.zeros_like(theta2)
         )
         theta1 += torch.where(
-            torch.abs(theta1 + period / 2) < 1e-6, period, torch.zeros_like(theta1)
+            torch.abs(theta1 + period /
+                      2) < 1e-6, period, torch.zeros_like(theta1)
         )
 
         ksi = torch.abs(theta2 - theta1)
@@ -776,7 +793,8 @@ class GB5DOF(nn.Module):
             & (sp[:, 1:] == sp[:, :-1])
         )
 
-        unique_sorted = torch.ones((N, M), dtype=torch.bool, device=dis_sorted.device)
+        unique_sorted = torch.ones(
+            (N, M), dtype=torch.bool, device=dis_sorted.device)
         unique_sorted[:, 1:] = ~same_as_prev
 
         dis_perm = dis_sorted.gather(1, idx)
@@ -786,7 +804,7 @@ class GB5DOF(nn.Module):
         valid = torch.zeros((N, M), dtype=torch.bool, device=dis_sorted.device)
         valid.scatter_(1, idx, valid_sorted)
 
-        return valid, dis_sorted, ksi_sorted, eta_sorted, phi_sorted
+        return valid, dis_r, ksi_r, eta_r, phi_r
 
     def _compute_shared(self, P: torch.Tensor, Q: torch.Tensor):
         """
@@ -833,71 +851,99 @@ class GB5DOF(nn.Module):
         return V, axi, psi
 
     def mat2quat(self, R: torch.Tensor) -> torch.Tensor:
-        orig_shape = R.shape[:-2]
+        """
+        MATLAB GB5DOF-compatible matrix-to-quaternion conversion.
+
+        This intentionally reproduces the special near-180-degree branch
+        in the reference MATLAB implementation.
+        """
+        original_shape = R.shape[:-2]
         R = R.reshape(-1, 3, 3)
 
-        m00, m11, m22 = R[:, 0, 0], R[:, 1, 1], R[:, 2, 2]
+        m00 = R[:, 0, 0]
+        m11 = R[:, 1, 1]
+        m22 = R[:, 2, 2]
+
         trace = m00 + m11 + m22
 
-        # Compute all 4 cases unconditionally
-        # Case 1: trace > 0
-        s1 = torch.sqrt((1.0 + trace).clamp(min=1e-12)) * 2.0
-        q1 = torch.stack(
+        # MATLAB regular branch
+        regular = trace > -0.999999999
+
+        e0_regular = 0.5 * torch.sqrt(
+            torch.clamp(1.0 + trace, min=0.0)
+        )
+        safe_e0 = torch.where(
+            e0_regular > 0.0,
+            e0_regular,
+            torch.ones_like(e0_regular),
+        )
+
+        e_regular = torch.stack(
             [
-                0.25 * s1,
-                (R[:, 2, 1] - R[:, 1, 2]) / s1,
-                (R[:, 0, 2] - R[:, 2, 0]) / s1,
-                (R[:, 1, 0] - R[:, 0, 1]) / s1,
+                R[:, 1, 2] - R[:, 2, 1],
+                R[:, 2, 0] - R[:, 0, 2],
+                R[:, 0, 1] - R[:, 1, 0],
+            ],
+            dim=-1,
+        ) / (4.0 * safe_e0[:, None])
+
+        # MATLAB near-180-degree branch
+        e3 = torch.sqrt(
+            torch.clamp(-(m00 + m11) / 2.0, min=0.0)
+        )
+        use_e3 = torch.abs(e3) > 2.0e-8
+        safe_e3 = torch.where(use_e3, e3, torch.ones_like(e3))
+
+        e_from_e3 = torch.stack(
+            [
+                R[:, 0, 2] / (2.0 * safe_e3),
+                R[:, 1, 2] / (2.0 * safe_e3),
+                e3,
             ],
             dim=-1,
         )
 
-        # Case 2: m00 largest
-        s2 = torch.sqrt((1.0 + m00 - m11 - m22).clamp(min=1e-12)) * 2.0
-        q2 = torch.stack(
+        e1 = torch.sqrt(
+            torch.clamp((m00 + 1.0) / 2.0, min=0.0)
+        )
+        use_e1 = e1 != 0.0
+        safe_e1 = torch.where(use_e1, e1, torch.ones_like(e1))
+
+        e_from_e1 = torch.stack(
             [
-                (R[:, 2, 1] - R[:, 1, 2]) / s2,
-                0.25 * s2,
-                (R[:, 0, 1] + R[:, 1, 0]) / s2,
-                (R[:, 0, 2] + R[:, 2, 0]) / s2,
+                e1,
+                R[:, 1, 0] / (2.0 * safe_e1),
+                torch.zeros_like(e1),
             ],
             dim=-1,
         )
 
-        # Case 3: m11 largest
-        s3 = torch.sqrt((1.0 + m11 - m00 - m22).clamp(min=1e-12)) * 2.0
-        q3 = torch.stack(
+        e_fallback = torch.stack(
             [
-                (R[:, 0, 2] - R[:, 2, 0]) / s3,
-                (R[:, 0, 1] + R[:, 1, 0]) / s3,
-                0.25 * s3,
-                (R[:, 1, 2] + R[:, 2, 1]) / s3,
+                torch.zeros_like(e1),
+                torch.ones_like(e1),
+                torch.zeros_like(e1),
             ],
             dim=-1,
         )
 
-        # Case 4: m22 largest
-        s4 = torch.sqrt((1.0 + m22 - m00 - m11).clamp(min=1e-12)) * 2.0
-        q4 = torch.stack(
-            [
-                (R[:, 1, 0] - R[:, 0, 1]) / s4,
-                (R[:, 0, 2] + R[:, 2, 0]) / s4,
-                (R[:, 1, 2] + R[:, 2, 1]) / s4,
-                0.25 * s4,
-            ],
-            dim=-1,
+        e_special = torch.where(
+            use_e3[:, None],
+            e_from_e3,
+            torch.where(use_e1[:, None], e_from_e1, e_fallback),
         )
 
-        # Select correct case with torch.where — no branching
-        c1 = trace > 0
-        c2 = (~c1) & (m00 > m11) & (m00 > m22)
-        c3 = (~c1) & (~c2) & (m11 > m22)
-        c4 = ~(c1 | c2 | c3)
+        e0 = torch.where(
+            regular,
+            e0_regular,
+            torch.zeros_like(e0_regular),
+        )
+        e = torch.where(regular[:, None], e_regular, e_special)
 
-        q = q1 * c1[:, None] + q2 * c2[:, None] + q3 * c3[:, None] + q4 * c4[:, None]
+        # MATLAB returns q = [e0; -e].
+        q = torch.cat([e0[:, None], -e], dim=-1)
 
-        q = q / torch.linalg.norm(q, dim=-1, keepdim=True).clamp(min=1e-12)
-        return q.reshape(*orig_shape, 4)
+        return q.reshape(*original_shape, 4)
 
     def quat2mat(self, q: torch.Tensor) -> torch.Tensor:
         """
@@ -1146,9 +1192,11 @@ if __name__ == "__main__":
     for _ in range(10):
         out_compiled = compiled(P, Q)
     t_compiled = (time() - t0) / 10
-    print(f"Compiled: {t_compiled * 1000:.2f} ms  |  result: {out_compiled[:3]}")
+    print(
+        f"Compiled: {t_compiled * 1000:.2f} ms  |  result: {out_compiled[:3]}")
 
     # ── Correctness check ────────────────────────────────────────────────
     print(f"\nMax diff: {(out_eager - out_compiled).abs().max().item():.2e}")
-    assert torch.allclose(out_eager, out_compiled, atol=1e-10), "Outputs differ!"
+    assert torch.allclose(out_eager, out_compiled,
+                          atol=1e-10), "Outputs differ!"
     print(f"Speedup: {t_eager / t_compiled:.2f}x")

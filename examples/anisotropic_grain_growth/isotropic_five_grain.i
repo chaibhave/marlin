@@ -43,7 +43,7 @@ d3 = 'sqrt((${lp}*sin(${kp}*(x-4)))^2  + (${lp}*sin(${kp}*(y-28)))^2)'
 d4 = 'sqrt((${lp}*sin(${kp}*(x-34)))^2 + (${lp}*sin(${kp}*(y-33)))^2)'
 
 g_gamma0 = '${fparse sqrt(2) / 3 }' # g(gamma=1.5)
-f0_gamma0 = 0.1411
+f0_gamma0 = ${fparse 1/8}
 kappa = '${fparse gbe_max * interface_width * sqrt(f0_gamma0) / g_gamma0 }'
 mu = '${fparse gbe_max  / (g_gamma0 * interface_width * sqrt(f0_gamma0) ) }'
 

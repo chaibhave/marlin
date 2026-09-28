@@ -7,7 +7,7 @@ gbe_max = '${units 0.8797226 J/m^2}'
 L = '${fparse 1.0 * 1.6 / ${interface_width}}'
 
 g_gamma0 = '${fparse sqrt(2) / 3}' # g(gamma=1.5)
-f0_gamma0 = 0.1411
+f0_gamma0 = ${fparse 1/8}
 kappa = '${fparse gbe_max * interface_width * sqrt(f0_gamma0) / g_gamma0}'
 mu = '${fparse gbe_max / (g_gamma0 * interface_width * sqrt(f0_gamma0))}'
 
