@@ -57,6 +57,13 @@ include           $(MOOSE_DIR)/modules/modules.mk
 ADDITIONAL_INCLUDES := -I$(FRAMEWORK_DIR)/contrib/gtest
 ADDITIONAL_LIBS     := $(FRAMEWORK_DIR)/contrib/gtest/libgtest.la
 
+# Qhull (C++ convex hull library), used to build anisotropic grain-boundary
+# energy surrogates. Provided by the moose-dev conda environment. Kept in
+# sync with the main application Makefile, which this unit test Makefile
+# does not include.
+ADDITIONAL_INCLUDES += -I$(CONDA_PREFIX)/include
+ADDITIONAL_LIBS     += -L$(CONDA_PREFIX)/lib -lqhullcpp -lqhullstatic_r
+
 # dep apps
 CURRENT_DIR        := $(shell pwd)
 APPLICATION_DIR    := $(CURRENT_DIR)/..

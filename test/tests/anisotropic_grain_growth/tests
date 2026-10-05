@@ -24,4 +24,16 @@
     max_parallel = 1
     min_slots = 2
   []
+
+  [polycrystal_sigma3_circular_grain]
+    type = CSVDiff
+    input = polycrystal_sigma3_circular_grain.i
+    csvdiff = polycrystal_sigma3_circular_grain_out.csv
+    rel_err = 1e-4
+    requirement = 'The system shall evolve two order parameters representing a circular grain using the O(N) PolycrystalAnisotropicGBEnergy object, which builds its convex-hull energy surrogate from grain orientations and a shared GB5DOF model rather than a per-pair precomputed hull.'
+    design = 'PolycrystalAnisotropicGBEnergy.md GrainOrientationsFromInput.md'
+    compute_devices = 'cpu cuda'
+    max_parallel = 1
+    min_slots = 2
+  []
 []

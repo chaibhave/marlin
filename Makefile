@@ -54,6 +54,11 @@ XFEM                        := no
 include $(MOOSE_DIR)/modules/modules.mk
 ###############################################################################
 
+# Qhull (C++ convex hull library), used to build anisotropic grain-boundary
+# energy surrogates. Provided by the moose-dev conda environment.
+ADDITIONAL_INCLUDES += -I$(CONDA_PREFIX)/include
+ADDITIONAL_LIBS     += -L$(CONDA_PREFIX)/lib -lqhullcpp -lqhullstatic_r
+
 # dep apps
 APPLICATION_DIR    := $(CURDIR)
 APPLICATION_NAME   := marlin
