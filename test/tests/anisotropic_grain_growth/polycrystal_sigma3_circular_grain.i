@@ -32,14 +32,16 @@ L = '${fparse 1.0 * 1.6 / ${interface_width}}'
       method = HOULI
       buffer = smooth
     []
-    # Two grain orientations: identity, and the Sigma-5-like 36.86989765 deg
-    # rotation about [001] already used for the pairwise hull data in
-    # scripts/gb_energy/generate_gb_hulls.py (R1/R2).
+    # Two grain orientations: identity, and the Sigma-3 twin-like 60 deg
+    # rotation about [111] (R1/R3 in scripts/gb_energy/generate_gb_hulls.py),
+    # matching the misorientation used by the pairwise sigma3_circular_grain.i.
     [orientations]
       type = GrainOrientationsFromInput
       buffer = orientations
       rotation_matrices = '1 0 0 0 1 0 0 0 1;
-                           0.8 -0.6 0 0.6 0.8 0 0 0 1'
+                           0.6666666666666666 -0.3333333333333333 0.6666666666666666
+                           0.6666666666666666 0.6666666666666666 -0.3333333333333333
+                           -0.3333333333333333 0.6666666666666666 0.6666666666666666'
     []
   []
   [Solve]

@@ -170,7 +170,11 @@ buildHullEquations(torch::jit::script::Module & gb5dof,
                    const torch::Tensor & R_j,
                    const HullBuildOptions & options)
 {
-  const auto sampling_options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
+  // R_i/R_j (and gb5dof) are already on whichever device/dtype the caller chose for
+  // hull sampling (PolycrystalAnisotropicGBEnergy::buildHulls() picks the simulation's
+  // accelerator if it supports float64, else CPU); match it here so fibonacciSphere's
+  // normals land on the same device as the model and inputs.
+  const auto sampling_options = R_i.options();
 
   const auto normals = fibonacciSphere(options.num_samples, sampling_options);
   const auto pts = sampleInverseEnergySurface(

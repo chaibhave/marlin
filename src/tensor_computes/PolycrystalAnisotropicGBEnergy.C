@@ -58,7 +58,11 @@ PolycrystalAnisotropicGBEnergy::validParams()
       "linear_coefficient",
       "Shared linear reciprocal-space coefficient (-k^2 * L0 * kappa), one value for every "
       "order parameter.");
-  params.addRequiredParam<TensorOutputBufferName>("sigma", "Interpolated local GB energy.");
+  params.addRequiredParam<TensorOutputBufferName>(
+      "sigma",
+      "Diagnostic local GB energy: the op_i^2*op_j^2-weighted average of sigma_ij over pairs "
+      "that cleared the gradient mask at each point, or 0 where none did. This is independent "
+      "of the sigma used internally for the mobility L_NL (see buildHulls()/computeBuffer()).");
 
   params.addRequiredParam<DataFileName>("libtorch_model_file",
                                         "Path to the shared GB5DOF TorchScript model.");
@@ -89,6 +93,22 @@ PolycrystalAnisotropicGBEnergy::validParams()
       "eps", 1.0e-8, "eps > 0", "Facet-validity threshold for the hull surrogate.");
 
   return params;
+}
+
+namespace
+{
+/// gamma(sigma): the same closed-form reciprocal-GBE-to-isotropic-gamma map used identically
+/// across the existing anisotropic input files (g_to_gamma_func), reproduced here so buildHulls()
+/// and computeBuffer() share one definition instead of two copies of these coefficients.
+Real
+gammaFromSigma(Real sigma, Real inv_sqrt_kappa_mu)
+{
+  const Real g = sigma * inv_sqrt_kappa_mu;
+  const Real g2 = g * g;
+  const Real poly = -3.0944 * std::pow(g2, 4) - 1.8169 * std::pow(g2, 3) + 10.323 * g2 * g2 -
+                    8.1819 * g2 + 2.0033;
+  return 1.0 / poly;
+}
 }
 
 PolycrystalAnisotropicGBEnergy::PolycrystalAnisotropicGBEnergy(const InputParameters & parameters)
@@ -142,10 +162,10 @@ PolycrystalAnisotropicGBEnergy::PolycrystalAnisotropicGBEnergy(const InputParame
   for (const auto & name : NL_names)
     _NL.push_back(&getOutputBufferByName(name));
 
-  // _surrogate is only ever used for hull construction (buildHulls(), always
-  // on CPU/float64 for Qhull robustness - see there), so it is kept exactly
-  // as exported by export_gb5dof.py (CPU/float64) rather than moved to the
-  // simulation device/precision.
+  // _surrogate is only ever used for hull construction (buildHulls()), always
+  // in float64 for Qhull robustness - see there. It is loaded exactly as
+  // exported by export_gb5dof.py (CPU/float64); buildHulls() moves it to the
+  // simulation's accelerator only if that accelerator supports float64.
   _surrogate->eval();
 
   // See AnisotropicGBEnergy/PairwiseAnisotropicGBEnergy for the derivation of
@@ -168,17 +188,31 @@ PolycrystalAnisotropicGBEnergy::buildHulls()
       _orientations.size(2) != 3)
     mooseError("orientations buffer must have shape [n_grains, 3, 3]; got ", _orientations.sizes());
 
-  // Hull construction runs on CPU/float64 for Qhull robustness and
-  // reproducibility, independent of the simulation's device/precision.
-  // _surrogate is already CPU/float64 (see constructor).
-  const auto hull_options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
-  auto & gb5dof_cpu = *_surrogate;
+  // Hull construction always runs in float64, for Qhull robustness and
+  // reproducibility, independent of the simulation's precision. The device it
+  // runs on is the simulation's selected device (--compute-device /
+  // [Domain] device_names, via MooseTensor::floatTensorOptions()) if that
+  // device supports float64, otherwise CPU (e.g. MPS, which has no float64
+  // support at all). Qhull itself (runQhull(), called from
+  // buildHullEquations()) always runs on CPU regardless, since it is a CPU
+  // host-memory library; only the GB5DOF sampling benefits from an
+  // accelerator.
+  const auto simulation_device = MooseTensor::floatTensorOptions().device();
+  const auto sampling_device =
+      MooseTensor::supportsDoublePrecision(simulation_device) ? simulation_device : torch::kCPU;
+  const auto hull_options = torch::TensorOptions().dtype(torch::kFloat64).device(sampling_device);
+  _surrogate->to(sampling_device, torch::kFloat64);
+  auto & gb5dof_hull = *_surrogate;
+
+  _console << "PolycrystalAnisotropicGBEnergy: sampling GB5DOF on '" << sampling_device.str()
+           << "' (float64)" << std::endl;
 
   // Two-step conversion: MPS does not support float64 at all, even as a
   // transient step within a single combined device+dtype .to() call, so the
   // device move and the dtype cast cannot be combined when the source
-  // tensor lives on MPS.
-  const auto orientations_cpu = _orientations.to(torch::kCPU).to(hull_options);
+  // tensor lives on MPS. Routing through CPU first is safe regardless of
+  // sampling_device, since CPU supports every dtype involved.
+  const auto orientations_sampling = _orientations.to(torch::kCPU).to(hull_options);
 
   MarlinGBHull::HullBuildOptions options;
   options.num_samples = _num_samples;
@@ -196,9 +230,9 @@ PolycrystalAnisotropicGBEnergy::buildHulls()
     const auto i = _pair_index[p].first;
     const auto j = _pair_index[p].second;
 
-    const auto R_i = orientations_cpu.select(0, i);
-    const auto R_j = orientations_cpu.select(0, j);
-    const auto result = MarlinGBHull::buildHullEquations(gb5dof_cpu, R_i, R_j, options);
+    const auto R_i = orientations_sampling.select(0, i);
+    const auto R_j = orientations_sampling.select(0, j);
+    const auto result = MarlinGBHull::buildHullEquations(gb5dof_hull, R_i, R_j, options);
 
     _sigma_max = std::max(_sigma_max, result.sigma_max);
 
@@ -228,6 +262,11 @@ PolycrystalAnisotropicGBEnergy::buildHulls()
 
   _kappa = _sigma_max * _interface_width * std::sqrt(f0_gamma0) / g_gamma0;
   _mu = _sigma_max / (g_gamma0 * _interface_width * std::sqrt(f0_gamma0));
+
+  // gamma at the sharp maximum GB energy actually measured: the fill value used in
+  // computeBuffer() for pairs whose gradient mask fails at a given point, so that a vanishing
+  // minority order parameter still sees a finite (not zero) GB energy from every other grain.
+  _gamma_fill = gammaFromSigma(_sigma_max, 1.0 / std::sqrt(_kappa * _mu));
 
   _kappa_laplacian_factor = -_domain.getKSquare() * _kappa;
   _linear_coefficient_const = _L0 * _kappa_laplacian_factor;
@@ -302,10 +341,12 @@ PolycrystalAnisotropicGBEnergy::computeBuffer()
   {
     _bulk_sum.assign(_n_grains, torch::Tensor());
     _torque_vec.assign(_n_grains, torch::Tensor());
+    _valid_weight.assign(_n_grains, torch::Tensor());
     for (unsigned int g = 0; g < _n_grains; ++g)
     {
       _bulk_sum[g] = torch::zeros({batch_size}, opts);
       _torque_vec[g] = torch::zeros({batch_size, 3}, opts);
+      _valid_weight[g] = torch::zeros({batch_size}, opts);
     }
     _sigma_num = torch::zeros({batch_size}, opts);
     _sigma_den = torch::zeros({batch_size}, opts);
@@ -318,6 +359,7 @@ PolycrystalAnisotropicGBEnergy::computeBuffer()
     {
       _bulk_sum[g].zero_();
       _torque_vec[g].zero_();
+      _valid_weight[g].zero_();
     }
     _sigma_num.zero_();
     _sigma_den.zero_();
@@ -325,6 +367,7 @@ PolycrystalAnisotropicGBEnergy::computeBuffer()
   }
   auto & bulk_sum = _bulk_sum;
   auto & torque_vec = _torque_vec;
+  auto & valid_weight = _valid_weight;
   auto & sigma_num = _sigma_num;
   auto & sigma_den = _sigma_den;
   auto & f0_cross = _f0_cross;
@@ -465,6 +508,16 @@ PolycrystalAnisotropicGBEnergy::computeBuffer()
           .narrow(/*dim=*/0, chunk_start, chunk_length)
           .index_add_(0, valid_idx, gamma_ij * op_i_sq);
 
+      // Tracks, per grain, how much of every OTHER grain's op^2 was already covered by a pair
+      // that cleared the mask here, so the O(N) bulk-term fill below (gammaFromSigma(sigma_max)
+      // for every pair that did NOT clear the mask) can be added without a second N(N-1)/2 pass.
+      valid_weight[i]
+          .narrow(/*dim=*/0, chunk_start, chunk_length)
+          .index_add_(0, valid_idx, op_j_sq);
+      valid_weight[j]
+          .narrow(/*dim=*/0, chunk_start, chunk_length)
+          .index_add_(0, valid_idx, op_i_sq);
+
       torque_vec[i]
           .narrow(/*dim=*/0, chunk_start, chunk_length)
           .index_add_(0, valid_idx, coeff_ij.unsqueeze(1) * dsigma_dgrad_i_valid);
@@ -481,20 +534,51 @@ PolycrystalAnisotropicGBEnergy::computeBuffer()
     }
   }
 
-  // sigma_den is only index_add_'d at interface points (see the pair loop above), so it is
-  // exactly 0 wherever no pair touched this point at all. Left as 0/(0+eps) = 0 there, sigma
-  // (and so L_NL = L0*sigma/sigma_max) would be 0 away from every interface, making the
-  // (L_NL - L0)*kappa_laplacian_i correction term below equal -L0*kappa_laplacian_i instead of
-  // vanishing -- a spurious bulk forcing proportional to the order parameter's Laplacian,
-  // dragging the interface. Filling these points with sigma_max (matching
-  // PairwiseAnisotropicGBEnergy's analogous NaN-fill with the max measured GBE) instead gives
-  // L_NL = L0 there, so the correction term is exactly 0, as it should be away from any GB.
-  const auto bulk_mask = sigma_den <= 0;
-  auto sigma_ratio = sigma_num / (sigma_den + 1.0e-4);
-  sigma_ratio = torch::where(bulk_mask, torch::full_like(sigma_ratio, _sigma_max), sigma_ratio);
+  // Every pair not covered by valid_idx anywhere above contributes nothing to bulk_sum/f0_cross,
+  // which is the same as giving it gamma_ij = 0. That is wrong even deep in grain i's bulk: grain
+  // j's order parameter there is not exactly 0 (the softmax IC and periodic BCs give every grain
+  // a small but genuine nonzero tail everywhere), so its gamma should be a finite value, not 0 --
+  // gamma_ij=0 makes gr_j=0 linearly unstable in bulk (growth ~+L0*mu*gr_j instead of decay).
+  // Filled here, in O(N) rather than a second O(N^2) pass, using valid_weight[g] (how much of
+  // every other grain's op^2 a mask-clearing pair already covered for grain g) and the two
+  // symmetric power sums S=sum_g op_g^2, Q=sum_g op_g^4: the uncovered weight for grain g is
+  // (S - op_g^2) - valid_weight[g], and the uncovered pair weight overall is (S^2-Q)/2 -
+  // sigma_den (sum_{i<j} op_i^2*op_j^2 = (S^2 - Q)/2, with sigma_den already the covered part).
+  // Filled with gammaFromSigma(sigma_max) -- the same sharp maximum GB energy used as the
+  // mobility fill below -- matching PairwiseAnisotropicGBEnergy's analogous NaN-fill with
+  // the max measured GBE.
+  auto S = torch::zeros({batch_size}, opts);
+  auto Q = torch::zeros({batch_size}, opts);
+  for (unsigned int g = 0; g < _n_grains; ++g)
+  {
+    const auto op_g_sq = op_flat[g] * op_flat[g];
+    S = S + op_g_sq;
+    Q = Q + op_g_sq * op_g_sq;
+  }
+  // Sum over ALL pairs i<j of op_i^2*op_j^2 (the mobility denominator below), computed in O(N)
+  // rather than a second O(N^2) pass. Only exactly 0 where at most one grain is active (true bulk).
+  const auto pair_weight_sum = (0.5 * (S * S - Q)).clamp_min(0.0);
+  for (unsigned int g = 0; g < _n_grains; ++g)
+    bulk_sum[g] = bulk_sum[g] + _gamma_fill * (S - op_flat[g] * op_flat[g] - valid_weight[g]);
+  f0_cross = f0_cross + _gamma_fill * (pair_weight_sum - sigma_den);
 
-  _sigma = sigma_ratio.reshape(output_shape);
-  const auto L_NL_flat = _L0 * sigma_ratio / _sigma_max;
+  // Kinetic coefficient, as in the pairwise reference (five_grains_2D.i's sigma/L_NL computes):
+  // sigma_mob = sum_{i<j} op_i^2*op_j^2*sigma_ij / (sum_{i<j} op_i^2*op_j^2 + 1e-4) over EVERY
+  // pair, L_NL = L0*sigma_mob/sigma_max. sigma_num/sigma_den above are the partial sums over pairs
+  // that cleared the gradient mask; the remaining pair weight is filled with sigma_max, as the
+  // reference fills masked points with the max measured GBE. The +1e-4 is intentional: deep in a
+  // grain the pair weights are << 1e-4, so L_NL -> 0 there and the bulk does not evolve.
+  const auto sigma_num_full = sigma_num + _sigma_max * (pair_weight_sum - sigma_den);
+  const auto sigma_mobility = sigma_num_full / (pair_weight_sum + 1.0e-4);
+  const auto L_NL_flat = _L0 * sigma_mobility / _sigma_max;
+
+  // Diagnostic output only (not used for L_NL above): the plain op_i^2*op_j^2-weighted average of
+  // sigma_ij over pairs that cleared the mask at this point, with no regularizer, so it reads 0
+  // where no pair cleared the mask rather than blending in a sliver of noise (see
+  // the sigma speckle investigation that motivated this split). sigma_num is exactly 0 wherever
+  // sigma_den is exactly 0 (both accumulate over the same valid_idx), so clamping the denominator
+  // away from 0 gives 0/clamp = 0 there without a redundant where().
+  _sigma = (sigma_num / sigma_den.clamp_min(1.0e-30)).reshape(output_shape);
 
   auto f0_self_sum = torch::zeros({batch_size}, opts);
 

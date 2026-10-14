@@ -62,8 +62,11 @@ torch::Tensor normalizeEquations(const torch::Tensor & equations, int64_t dim);
  * Builds the merged convex-hull surrogate for one grain pair.
  *
  * @param gb5dof    A GB5DOF-compatible TorchScript module (forward(P, Q) -> energies),
- *                  already moved to CPU/float64 for sampling and Qhull robustness.
- * @param R_i, R_j  Orientation matrices for the two grains ([3,3] each).
+ *                  always float64, on whichever device the caller selected for hull
+ *                  sampling (an accelerator if it supports float64, else CPU). Qhull
+ *                  itself still always runs on CPU host memory regardless.
+ * @param R_i, R_j  Orientation matrices for the two grains ([3,3] each), on the same
+ *                  device/dtype as gb5dof.
  */
 HullResult buildHullEquations(torch::jit::script::Module & gb5dof,
                               const torch::Tensor & R_i,

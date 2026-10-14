@@ -36,6 +36,19 @@
  * actually form an interface, and scatter-accumulating directly into
  * per-grain outputs. No per-pair field is ever stored.
  *
+ * A pair whose gradient mask fails at a given point contributes gammaFromSigma(sigma_max) there
+ * instead of nothing: with nothing, a vanishing minority order parameter sees gamma_ij=0 from
+ * every other grain, which makes it linearly unstable in that grain's bulk. This bulk-term fill
+ * is accumulated once per grain (not per pair) from the two power sums sum_g op_g^2 and
+ * sum_g op_g^4, so it stays O(N) per point.
+ *
+ * The mobility matches the pairwise reference (five_grains_2D.i): L_NL = L0*sigma_mob/sigma_max,
+ * sigma_mob = sum_{i<j} op_i^2*op_j^2*sigma_ij / (sum_{i<j} op_i^2*op_j^2 + 1e-4) over all pairs,
+ * with pairs that failed the gradient mask filled with sigma_max. The +1e-4 drives L_NL to ~0 in
+ * grain bulk, where every pair weight is << 1e-4.
+ * 'sigma' is a separate, purely diagnostic quantity (not used for L_NL): the op_i^2*op_j^2-weighted
+ * average of sigma_ij over only the pairs that cleared the mask, or 0 where none did.
+ *
  * The inherited 'buffer' output (see TensorOperator) is the *total*
  * (bulk + gradient) free energy density, not just the bulk part: kappa is
  * only known once the hulls are built, so the gradient term
@@ -94,7 +107,7 @@ protected:
   /// Pair index i<j in the same order as _hull_equations/_hull_g.
   std::vector<std::pair<unsigned int, unsigned int>> _pair_index;
   /// Per-pair normalized hull facet equations ([F,dim+1], moved to the simulation
-  /// device/precision after being built on CPU/float64).
+  /// device/precision after being built in float64 -- see buildHulls()).
   std::vector<torch::Tensor> _hull_equations;
   /// Per-pair constant facet gradient g_k = c_k / (-d_k), shape [F,dim].
   std::vector<torch::Tensor> _hull_g;
@@ -102,6 +115,9 @@ protected:
   Real _sigma_max;
   Real _kappa;
   Real _mu;
+  /// gamma(sigma_max): the bulk-term fill for pairs whose gradient mask fails at a given point
+  /// (see computeBuffer()'s valid_weight/S/Q fill), set once alongside kappa/mu.
+  Real _gamma_fill;
   /// -k^2 * kappa, shared by every grain's Laplacian correction term.
   torch::Tensor _kappa_laplacian_factor;
   /// -k^2 * L0 * kappa, cached once and copied into the linear_coefficient
@@ -112,6 +128,9 @@ protected:
   /// zeroed in place every call thereafter, rather than torch::zeros()-allocated fresh each step.
   std::vector<torch::Tensor> _bulk_sum;
   std::vector<torch::Tensor> _torque_vec;
+  /// Per-grain, how much of every other grain's op^2 was already covered this step by a pair
+  /// that cleared the gradient mask (see computeBuffer()'s O(N) bulk-term fill).
+  std::vector<torch::Tensor> _valid_weight;
   torch::Tensor _sigma_num;
   torch::Tensor _sigma_den;
   torch::Tensor _f0_cross;

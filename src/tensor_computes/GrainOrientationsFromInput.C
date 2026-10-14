@@ -8,8 +8,6 @@
 
 #include "GrainOrientationsFromInput.h"
 
-#include "MarlinUtils.h"
-
 registerMooseObject("MarlinApp", GrainOrientationsFromInput);
 
 InputParameters
@@ -44,7 +42,9 @@ GrainOrientationsFromInput::computeBuffer()
     for (const auto & value : row)
       flat.push_back(value);
 
+  // Kept in float64 on CPU, independent of the simulation precision/device: the only consumer
+  // (PolycrystalAnisotropicGBEnergy) builds its GB-energy hulls from these, and near special CSL
+  // misorientations a float32 rounding of the matrices visibly changes GB5DOF's energies.
   _u = torch::from_blob(flat.data(), {static_cast<int64_t>(n_grains), 3, 3}, torch::kFloat64)
-           .to(MooseTensor::floatTensorOptions())
            .clone();
 }
