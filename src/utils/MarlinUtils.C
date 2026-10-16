@@ -122,12 +122,6 @@ complexFloatTensorOptions()
       .requires_grad(false);
 }
 
-bool
-supportsDoublePrecision(const torch::Device & device)
-{
-  return TorchDeviceSingleton::isSupported(torch::kFloat64, device);
-}
-
 const torch::TensorOptions
 intTensorOptions()
 {

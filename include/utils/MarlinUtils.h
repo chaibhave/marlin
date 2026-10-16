@@ -41,9 +41,6 @@ const torch::TensorOptions floatTensorOptions();
 const torch::TensorOptions complexFloatTensorOptions();
 const torch::TensorOptions intTensorOptions();
 
-/// Whether \p device supports float64 tensors (e.g. MPS does not).
-bool supportsDoublePrecision(const torch::Device & device);
-
 /// unsqueeze(0) ndim times
 torch::Tensor unsqueeze0(const torch::Tensor & t, unsigned int ndim);
 

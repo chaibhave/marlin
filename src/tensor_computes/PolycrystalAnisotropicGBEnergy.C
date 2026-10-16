@@ -162,10 +162,10 @@ PolycrystalAnisotropicGBEnergy::PolycrystalAnisotropicGBEnergy(const InputParame
   for (const auto & name : NL_names)
     _NL.push_back(&getOutputBufferByName(name));
 
-  // _surrogate is only ever used for hull construction (buildHulls()), always
-  // in float64 for Qhull robustness - see there. It is loaded exactly as
-  // exported by export_gb5dof.py (CPU/float64); buildHulls() moves it to the
-  // simulation's accelerator only if that accelerator supports float64.
+  // _surrogate is only ever used for hull construction (buildHulls(), always
+  // on CPU/float64 for Qhull robustness and because it is a traced module -
+  // see there), so it is kept exactly as exported by export_gb5dof.py
+  // (CPU/float64) rather than moved to the simulation device/precision.
   _surrogate->eval();
 
   // See AnisotropicGBEnergy/PairwiseAnisotropicGBEnergy for the derivation of
@@ -188,30 +188,38 @@ PolycrystalAnisotropicGBEnergy::buildHulls()
       _orientations.size(2) != 3)
     mooseError("orientations buffer must have shape [n_grains, 3, 3]; got ", _orientations.sizes());
 
-  // Hull construction always runs in float64, for Qhull robustness and
-  // reproducibility, independent of the simulation's precision. The device it
-  // runs on is the simulation's selected device (--compute-device /
-  // [Domain] device_names, via MooseTensor::floatTensorOptions()) if that
-  // device supports float64, otherwise CPU (e.g. MPS, which has no float64
-  // support at all). Qhull itself (runQhull(), called from
-  // buildHullEquations()) always runs on CPU regardless, since it is a CPU
-  // host-memory library; only the GB5DOF sampling benefits from an
-  // accelerator.
-  const auto simulation_device = MooseTensor::floatTensorOptions().device();
-  const auto sampling_device =
-      MooseTensor::supportsDoublePrecision(simulation_device) ? simulation_device : torch::kCPU;
-  const auto hull_options = torch::TensorOptions().dtype(torch::kFloat64).device(sampling_device);
-  _surrogate->to(sampling_device, torch::kFloat64);
+  // Hull construction always runs on CPU/float64, for Qhull robustness and
+  // reproducibility, independent of the simulation's device/precision.
+  // _surrogate (Ni_GB5DOF.pt) is a *traced*, not scripted, TorchScript module
+  // (see export_gb5dof.py): any tensor-allocating op whose device argument
+  // isn't a direct function of an input tensor (e.g. GB5DOF.symmetryVariants's
+  // torch::zeros(..., device=Q.device)) gets its concrete device baked into
+  // the traced graph as a literal at trace time (CPU, since export_gb5dof.py
+  // traces on CPU). Module::to(device) moves parameters/buffers but cannot
+  // rewrite those baked-in literals, so moving the module to an accelerator
+  // would make it allocate some internal tensors on CPU while receiving
+  // accelerator-resident inputs, erroring in ops like `V[:, 0] = Q`. Making
+  // GB5DOF.py scriptable (so this would move cleanly, as
+  // PairwiseAnisotropicGBEnergy's per-pair GrainBoundaryEnergyHull module
+  // already does) is possible but nontrivial and not done here -- see the
+  // discussion on this commit. GB5DOF sampling at the default num_samples is
+  // the dominant cost of hull construction (Qhull itself is comparatively
+  // cheap and CPU-only regardless), so an accelerator would meaningfully cut
+  // startup time for large N -- this is a deliberate deferral given the
+  // scripting work involved, not a claim that accelerating it wouldn't help.
+  const auto hull_options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
+  _surrogate->to(torch::kCPU, torch::kFloat64);
   auto & gb5dof_hull = *_surrogate;
 
-  _console << "PolycrystalAnisotropicGBEnergy: sampling GB5DOF on '" << sampling_device.str()
-           << "' (float64)" << std::endl;
-
-  // Two-step conversion: MPS does not support float64 at all, even as a
-  // transient step within a single combined device+dtype .to() call, so the
-  // device move and the dtype cast cannot be combined when the source
-  // tensor lives on MPS. Routing through CPU first is safe regardless of
-  // sampling_device, since CPU supports every dtype involved.
+  // Kept in float64 (not cast to the simulation's precision) regardless of the
+  // simulation's device: near special CSL misorientations (e.g. Sigma-3) a
+  // float32 rounding of the orientation matrices visibly changes GB5DOF's
+  // sampled energies and the resulting hull's facet count (see
+  // GrainOrientationsFromInput.C/GrainOrientationsFromFile.C). Two-step
+  // conversion (through CPU) because MPS does not support float64 at all,
+  // even as a transient step within a single combined device+dtype .to()
+  // call, so the device move and the dtype cast cannot be combined when the
+  // source tensor lives on MPS.
   const auto orientations_sampling = _orientations.to(torch::kCPU).to(hull_options);
 
   MarlinGBHull::HullBuildOptions options;
