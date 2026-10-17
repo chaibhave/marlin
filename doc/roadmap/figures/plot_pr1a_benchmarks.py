@@ -10,6 +10,7 @@ Reads doc/roadmap/logs/petsc_torch_benchmark_{cpu,cuda}.log and produces:
 
 Run from doc/roadmap/figures/: python3 plot_pr1a_benchmarks.py
 """
+
 import re
 from pathlib import Path
 
@@ -22,25 +23,27 @@ LOGS = HERE.parent / "logs"
 COLOR_TORCH = "#DE8F05"
 COLOR_PETSC = "#0173B2"
 
-matplotlib.rcParams.update({
-    "font.family": "serif",
-    "font.size": 9,
-    "axes.labelsize": 9,
-    "axes.titlesize": 9,
-    "xtick.labelsize": 8,
-    "ytick.labelsize": 8,
-    "legend.fontsize": 8,
-    "lines.linewidth": 1.2,
-    "lines.markersize": 4,
-    "axes.linewidth": 0.8,
-    "axes.spines.top": False,
-    "axes.spines.right": False,
-    "xtick.direction": "in",
-    "ytick.direction": "in",
-    "legend.frameon": False,
-    "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.05,
-})
+matplotlib.rcParams.update(
+    {
+        "font.family": "serif",
+        "font.size": 9,
+        "axes.labelsize": 9,
+        "axes.titlesize": 9,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "legend.fontsize": 8,
+        "lines.linewidth": 1.2,
+        "lines.markersize": 4,
+        "axes.linewidth": 0.8,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "legend.frameon": False,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.05,
+    }
+)
 
 
 def parse_timing_sweep(log_text, label):
@@ -50,8 +53,9 @@ def parse_timing_sweep(log_text, label):
     e.g. " (zero-copy Vec)" or " CUDA (zero-copy Vec)".
     """
     pattern = re.compile(
-        r"n=(\d+) torch-native: ([\d.]+)ms, \d+ iters \| PETSc" + re.escape(label) +
-        r": ([\d.]+)ms, \d+ iters"
+        r"n=(\d+) torch-native: ([\d.]+)ms, \d+ iters \| PETSc"
+        + re.escape(label)
+        + r": ([\d.]+)ms, \d+ iters"
     )
     ns, torch_ms, petsc_ms = [], [], []
     for m in pattern.finditer(log_text):
@@ -64,8 +68,9 @@ def parse_timing_sweep(log_text, label):
 def parse_anisotropic(log_text, test_name):
     """Parse the AnisotropicAMGConvergesFasterThanJacobi(-Cuda) line."""
     pattern = re.compile(
-        r"\[ RUN      \] PetscTorchMatrixFreeBenchmarkTest\." + re.escape(test_name) +
-        r"\nanisotropic.*?: Jacobi (\d+) its, ([\d.]+)ms \| AMG \(PCGAMG\) (\d+) its, "
+        r"\[ RUN      \] PetscTorchMatrixFreeBenchmarkTest\."
+        + re.escape(test_name)
+        + r"\nanisotropic.*?: Jacobi (\d+) its, ([\d.]+)ms \| AMG \(PCGAMG\) (\d+) its, "
         r"([\d.]+)ms solve \+ ([\d.]+)ms Pmat assembly"
     )
     m = pattern.search(log_text)
@@ -83,7 +88,9 @@ def parse_anisotropic(log_text, test_name):
 
 def plot_timing_sweep(cpu_log, cuda_log):
     n_cpu, torch_cpu, petsc_cpu = parse_timing_sweep(cpu_log, " (zero-copy Vec)")
-    n_cuda, torch_cuda, petsc_cuda = parse_timing_sweep(cuda_log, " CUDA (zero-copy Vec)")
+    n_cuda, torch_cuda, petsc_cuda = parse_timing_sweep(
+        cuda_log, " CUDA (zero-copy Vec)"
+    )
 
     fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.8), sharey=False)
 
@@ -96,9 +103,13 @@ def plot_timing_sweep(cpu_log, cuda_log):
     ax.legend(loc="upper left")
     ax.grid(True, which="both", linewidth=0.4, alpha=0.3)
 
+    # CUDA times span under one decade (~4 to ~32 ms), so a linear y-axis from
+    # zero shows the launch-latency floor and the growth honestly; log-x stays
+    # because n doubles between points.
     ax = axes[1]
-    ax.loglog(n_cuda, torch_cuda, "o-", color=COLOR_TORCH, label="torch-native")
-    ax.loglog(n_cuda, petsc_cuda, "s-", color=COLOR_PETSC, label="PETSc (zero-copy)")
+    ax.semilogx(n_cuda, torch_cuda, "o-", color=COLOR_TORCH, label="torch-native")
+    ax.semilogx(n_cuda, petsc_cuda, "s-", color=COLOR_PETSC, label="PETSc (zero-copy)")
+    ax.set_ylim(0, max(petsc_cuda + torch_cuda) * 1.08)
     ax.set_xlabel(r"$n$ (grid points per side)")
     ax.set_ylabel("CG solve wall-clock time (ms)")
     ax.set_title("CUDA")
@@ -129,8 +140,16 @@ def plot_anisotropic(cpu_log, cuda_log):
     fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.8))
 
     ax = axes[0]
-    ax.bar([i - width / 2 for i in x], jacobi_its, width, color=COLOR_TORCH, label="Jacobi")
-    ax.bar([i + width / 2 for i in x], amg_its, width, color=COLOR_PETSC, label="AMG (PCGAMG)")
+    ax.bar(
+        [i - width / 2 for i in x], jacobi_its, width, color=COLOR_TORCH, label="Jacobi"
+    )
+    ax.bar(
+        [i + width / 2 for i in x],
+        amg_its,
+        width,
+        color=COLOR_PETSC,
+        label="AMG (PCGAMG)",
+    )
     ax.set_xticks(list(x))
     ax.set_xticklabels(devices)
     ax.set_ylabel("CG iterations")
@@ -143,9 +162,16 @@ def plot_anisotropic(cpu_log, cuda_log):
         ax.text(i + width / 2, v + 3, str(v), ha="center", va="bottom", fontsize=7)
 
     ax = axes[1]
-    ax.bar([i - width / 2 for i in x], jacobi_ms, width, color=COLOR_TORCH, label="Jacobi")
-    ax.bar([i + width / 2 for i in x], amg_total_ms, width, color=COLOR_PETSC,
-           label="AMG (solve + Pmat assembly)")
+    ax.bar(
+        [i - width / 2 for i in x], jacobi_ms, width, color=COLOR_TORCH, label="Jacobi"
+    )
+    ax.bar(
+        [i + width / 2 for i in x],
+        amg_total_ms,
+        width,
+        color=COLOR_PETSC,
+        label="AMG (solve + Pmat assembly)",
+    )
     ax.set_xticks(list(x))
     ax.set_xticklabels(devices)
     ax.set_ylabel("KSPSolve wall-clock time (ms)")
@@ -153,9 +179,23 @@ def plot_anisotropic(cpu_log, cuda_log):
     ax.set_ylim(0, max(amg_total_ms) * 1.3)
     ax.legend(loc="upper center", ncol=1, bbox_to_anchor=(0.5, 1.0), fontsize=7)
     for i, v in zip(x, jacobi_ms):
-        ax.text(i - width / 2, v + max(amg_total_ms) * 0.02, f"{v:.1f}", ha="center", va="bottom", fontsize=7)
+        ax.text(
+            i - width / 2,
+            v + max(amg_total_ms) * 0.02,
+            f"{v:.1f}",
+            ha="center",
+            va="bottom",
+            fontsize=7,
+        )
     for i, v in zip(x, amg_total_ms):
-        ax.text(i + width / 2, v + max(amg_total_ms) * 0.02, f"{v:.1f}", ha="center", va="bottom", fontsize=7)
+        ax.text(
+            i + width / 2,
+            v + max(amg_total_ms) * 0.02,
+            f"{v:.1f}",
+            ha="center",
+            va="bottom",
+            fontsize=7,
+        )
 
     fig.tight_layout()
     fig.savefig(HERE / "anisotropic_amg_vs_jacobi.pdf")
