@@ -417,6 +417,19 @@ namespace
 // mobility tensors R7 is concerned about (e.g. KKS/grand-potential). The
 // resulting matrix has a condition number that grows with Dx/Dy, which is
 // what defeats a direction-blind (scalar) Jacobi preconditioner.
+/// Per-preconditioner result of the anisotropic comparison. KSPSetUp (which
+/// calls PCSetUp, i.e. builds the GAMG hierarchy) is timed apart from
+/// KSPSolve, because PETSc otherwise runs it lazily inside the first
+/// KSPSolve and charges it to the solve. repeat_ms is a second solve on the
+/// same KSP with the PC reused, i.e. the cost when Pmat/PC setup is amortized.
+struct AnisoSolveResult
+{
+  PetscInt its;
+  double setup_ms;
+  double solve_ms;
+  double repeat_ms;
+};
+
 constexpr double aniso_Dx = 1.0;
 constexpr double aniso_Dy = 1.0e-4;
 constexpr double aniso_shift = 1.0e-3;
@@ -561,12 +574,10 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, AnisotropicAMGConvergesFasterThanJacobi)
       PETSC_COMM_SELF,
       MatShellSetOperation(amat, MATOP_GET_DIAGONAL, (void (*)(void))anisoShellGetDiagonal));
 
-  // Returns (iterations, solve wall-clock ms). Fewer AMG iterations is only
-  // a genuine win if the wall-clock time is also lower - GAMG's per-iteration
-  // setup/apply cost is higher than Jacobi's, so the iteration-count
-  // comparison alone (as this test originally only reported) doesn't say
-  // which leg is actually faster.
-  auto run = [&](PCType pc_type, Mat pmat) -> std::pair<PetscInt, double>
+  // Fewer AMG iterations is only a genuine win if the wall-clock time is also
+  // lower, so each leg reports KSPSetUp, a first KSPSolve, and a second
+  // KSPSolve with the PC reused as separate times (see AnisoSolveResult).
+  auto run = [&](PCType pc_type, Mat pmat) -> AnisoSolveResult
   {
     auto x_tensor = torch::zeros({n * n}, torch::kDouble);
     Vec b_vec, x_vec;
@@ -588,9 +599,11 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, AnisotropicAMGConvergesFasterThanJacobi)
     PetscCallAbort(PETSC_COMM_SELF, KSPGetPC(ksp, &pc));
     PetscCallAbort(PETSC_COMM_SELF, PCSetType(pc, pc_type));
 
-    // Timed region covers KSPSolve only, matching this file's other timing
-    // sweeps (Sections 4/6/7) - PC/KSP setup above is configuration, not
-    // part of the per-solve cost being compared.
+    const auto t_setup0 = high_resolution_clock::now();
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetUp(ksp));
+    const auto t_setup1 = high_resolution_clock::now();
+    const duration<double, std::milli> setup_ms = t_setup1 - t_setup0;
+
     const auto t0 = high_resolution_clock::now();
     PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
     const auto t1 = high_resolution_clock::now();
@@ -604,34 +617,48 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, AnisotropicAMGConvergesFasterThanJacobi)
     EXPECT_GT(reason, 0) << "KSP (" << pc_type << ") failed to converge";
     EXPECT_NEAR((x_tensor - x_exact).norm().item<double>(), 0.0, 1e-5);
 
+    // Second solve from a zero guess on the same KSP: PC setup is reused.
+    x_tensor.zero_();
+    const auto t2 = high_resolution_clock::now();
+    PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
+    const auto t3 = high_resolution_clock::now();
+    const duration<double, std::milli> repeat_ms = t3 - t2;
+
+    PetscInt repeat_its;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetIterationNumber(ksp, &repeat_its));
+    EXPECT_EQ(repeat_its, its) << "repeat solve iteration count differs from first solve";
+    EXPECT_NEAR((x_tensor - x_exact).norm().item<double>(), 0.0, 1e-5);
+
     PetscCallAbort(PETSC_COMM_SELF, KSPDestroy(&ksp));
     PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&b_vec));
     PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&x_vec));
-    return {its, solve_ms.count()};
+    return {its, setup_ms.count(), solve_ms.count(), repeat_ms.count()};
   };
 
   // Jacobi-preconditioned leg: pmat == amat (PCJACOBI only needs the
   // diagonal, which the shell's MatGetDiagonal callback already supplies).
-  const auto [jacobi_its, jacobi_ms] = run(PCJACOBI, amat);
+  const auto jacobi = run(PCJACOBI, amat);
 
   // AMG-preconditioned leg: a real assembled Pmat built from the same
   // coefficients, matrix-free Amat unchanged (PR4a's mixed mode). Pmat
-  // assembly is timed separately from the solve, since it is a one-time
-  // setup cost (Section~sec:decisions item 3's reassembly cadence), not
-  // part of each KSPSolve.
+  // assembly is timed separately from PC setup and from the solves. Whether
+  // setup is paid once or per step depends on the reassembly cadence
+  // (roadmap Sec. 3 item 3: every Picard iteration by default).
   const auto t_asm0 = high_resolution_clock::now();
   Mat pmat = assembleAnisotropicMat(n, aniso_Dx, aniso_Dy, aniso_shift);
   const auto t_asm1 = high_resolution_clock::now();
   const duration<double, std::milli> pmat_assembly_ms = t_asm1 - t_asm0;
-  const auto [amg_its, amg_ms] = run(PCGAMG, pmat);
+  const auto amg = run(PCGAMG, pmat);
 
   // The whole point of R7/PR4a: AMG built from the real coefficients should
   // need substantially fewer iterations than direction-blind Jacobi once the
   // anisotropy ratio (Dx/Dy here: 1e4) is severe enough to defeat it.
-  EXPECT_LT(amg_its, jacobi_its);
-  Moose::out << "anisotropic (Dx/Dy=" << (aniso_Dx / aniso_Dy) << "): Jacobi " << jacobi_its
-             << " its, " << jacobi_ms << "ms | AMG (PCGAMG) " << amg_its << " its, " << amg_ms
-             << "ms solve + " << pmat_assembly_ms.count() << "ms Pmat assembly\n";
+  EXPECT_LT(amg.its, jacobi.its);
+  Moose::out << "anisotropic (Dx/Dy=" << (aniso_Dx / aniso_Dy) << "): Jacobi " << jacobi.its
+             << " its, setup " << jacobi.setup_ms << "ms, solve " << jacobi.solve_ms
+             << "ms, repeat solve " << jacobi.repeat_ms << "ms | AMG (PCGAMG) " << amg.its
+             << " its, Pmat assembly " << pmat_assembly_ms.count() << "ms, setup " << amg.setup_ms
+             << "ms, solve " << amg.solve_ms << "ms, repeat solve " << amg.repeat_ms << "ms\n";
 
   PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&pmat));
   PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&amat));
@@ -826,6 +853,28 @@ cudaShellGetDiagonal(Mat mat, Vec diag)
   return PETSC_SUCCESS;
 }
 
+/// PeriodicStencilOperator followed by a device-to-device copy of the result
+/// into a fresh tensor. This is the extra per-matvec work cudaShellMatMult
+/// does (it copies torch's conv output into PETSc's y array), so a
+/// torch-native solve with this operator isolates how much of the PETSc
+/// leg's CUDA slowdown that copy explains.
+class CopyingStencilOperator
+{
+public:
+  CopyingStencilOperator(const PeriodicStencilOperator & op) : _op(op) {}
+
+  torch::Tensor operator()(const torch::Tensor & x) const
+  {
+    const auto result = _op(x);
+    auto copy = torch::empty_like(result);
+    copy.copy_(result);
+    return copy;
+  }
+
+private:
+  const PeriodicStencilOperator & _op;
+};
+
 /// CUDA counterparts of Section 5's anisoShellMatMult/anisoShellGetDiagonal,
 /// identical in structure to cudaShellMatMult/cudaShellGetDiagonal above but
 /// operating on AnisoShellContext (Section 5) instead of ShellContext.
@@ -964,7 +1013,10 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
 
   const auto cuda_opts = torch::TensorOptions().dtype(torch::kDouble).device(torch::kCUDA);
 
-  for (const int64_t n : {32, 64, 128, 256, 512, 1024, 2048})
+  // n=16384 is 2.7e8 unknowns (2.1 GB per double vector); the largest sizes
+  // are meant for a large-memory GPU (H200) and will throw on an out-of-memory
+  // device rather than be skipped.
+  for (const int64_t n : {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384})
   {
     PeriodicStencilOperator A(n, shift, torch::kCUDA);
     ShellContext ctx{&A, n, 4.0 + shift};
@@ -979,6 +1031,20 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
     (void)x_torch;
     (void)torch_norm;
     const duration<double, std::milli> torch_ms = t1 - t0;
+
+    // torch-native leg again, with the same extra device-to-device copy per
+    // matvec that cudaShellMatMult performs (see CopyingStencilOperator).
+    CopyingStencilOperator A_copy(A);
+    JacobiPreconditioner M(4.0 + shift);
+    cudaDeviceSynchronize();
+    auto t_c0 = high_resolution_clock::now();
+    const auto [x_copy, copy_it, copy_norm] =
+        MooseTensor::conjugateGradientSolve(A_copy, b_tensor, torch::Tensor(), rel_tol, 0, M);
+    cudaDeviceSynchronize();
+    auto t_c1 = high_resolution_clock::now();
+    (void)x_copy;
+    (void)copy_norm;
+    const duration<double, std::milli> torch_copy_ms = t_c1 - t_c0;
 
     auto x_tensor = torch::zeros({n * n}, cuda_opts);
     Mat mat;
@@ -1009,7 +1075,15 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
     PetscCallAbort(PETSC_COMM_SELF, KSPGetPC(ksp, &pc));
     PetscCallAbort(PETSC_COMM_SELF, PCSetType(pc, PCJACOBI));
 
+    // KSPSetUp (work-vector allocation, PCSetUp) is timed on its own;
+    // otherwise PETSc runs it lazily inside the first KSPSolve.
     cudaDeviceSynchronize();
+    auto t_s0 = high_resolution_clock::now();
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetUp(ksp));
+    cudaDeviceSynchronize();
+    auto t_s1 = high_resolution_clock::now();
+    const duration<double, std::milli> petsc_setup_ms = t_s1 - t_s0;
+
     auto t2 = high_resolution_clock::now();
     PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
     cudaDeviceSynchronize();
@@ -1024,8 +1098,10 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
     const double used_mb = (total_bytes - free_bytes) / (1024.0 * 1024.0);
 
     Moose::out << "n=" << n << " torch-native: " << torch_ms.count() << "ms, " << torch_it
-               << " iters | PETSc CUDA (zero-copy Vec): " << petsc_zero_copy_ms.count() << "ms, "
-               << petsc_it << " iters | device mem used so far: " << used_mb << " MB"
+               << " iters | torch-native + per-matvec D2D copy: " << torch_copy_ms.count() << "ms, "
+               << copy_it << " iters | PETSc CUDA (zero-copy Vec): setup " << petsc_setup_ms.count()
+               << "ms, solve " << petsc_zero_copy_ms.count() << "ms, " << petsc_it
+               << " iters | device mem used so far: " << used_mb << " MB"
                << " | host peak RSS so far: " << peakRssKB() << " KB\n";
 
     PetscCallAbort(PETSC_COMM_SELF, KSPDestroy(&ksp));
@@ -1071,11 +1147,12 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, AnisotropicCudaAMGConvergesFasterThanJac
   using std::chrono::duration;
   using std::chrono::high_resolution_clock;
 
-  // Returns (iterations, solve wall-clock ms). cudaDeviceSynchronize()
-  // brackets the timed region (matching DISABLED_CudaTimingSweep's
-  // pattern), since CUDA kernel launches are asynchronous and the host
-  // clock would otherwise measure launch latency, not completion.
-  auto run = [&](PCType pc_type, Mat pmat) -> std::pair<PetscInt, double>
+  // Reports KSPSetUp, a first KSPSolve, and a repeat KSPSolve with the PC
+  // reused (see AnisoSolveResult). cudaDeviceSynchronize() brackets every
+  // timed region (matching DISABLED_CudaTimingSweep's pattern), since CUDA
+  // kernel launches are asynchronous and the host clock would otherwise
+  // measure launch latency, not completion.
+  auto run = [&](PCType pc_type, Mat pmat) -> AnisoSolveResult
   {
     auto x_tensor = torch::zeros({n * n}, cuda_opts);
     Vec b_vec, x_vec;
@@ -1098,6 +1175,12 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, AnisotropicCudaAMGConvergesFasterThanJac
     PetscCallAbort(PETSC_COMM_SELF, PCSetType(pc, pc_type));
 
     cudaDeviceSynchronize();
+    const auto t_setup0 = high_resolution_clock::now();
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetUp(ksp));
+    cudaDeviceSynchronize();
+    const auto t_setup1 = high_resolution_clock::now();
+    const duration<double, std::milli> setup_ms = t_setup1 - t_setup0;
+
     const auto t0 = high_resolution_clock::now();
     PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
     cudaDeviceSynchronize();
@@ -1112,30 +1195,48 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, AnisotropicCudaAMGConvergesFasterThanJac
     EXPECT_GT(reason, 0) << "KSP (" << pc_type << ") failed to converge";
     EXPECT_NEAR((x_tensor - x_exact).norm().item<double>(), 0.0, 1e-5);
 
+    // Second solve from a zero guess on the same KSP: PC setup is reused.
+    x_tensor.zero_();
+    cudaDeviceSynchronize();
+    const auto t2 = high_resolution_clock::now();
+    PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
+    cudaDeviceSynchronize();
+    const auto t3 = high_resolution_clock::now();
+    const duration<double, std::milli> repeat_ms = t3 - t2;
+
+    PetscInt repeat_its;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetIterationNumber(ksp, &repeat_its));
+    EXPECT_EQ(repeat_its, its) << "repeat solve iteration count differs from first solve";
+    EXPECT_NEAR((x_tensor - x_exact).norm().item<double>(), 0.0, 1e-5);
+
     PetscCallAbort(PETSC_COMM_SELF, KSPDestroy(&ksp));
     PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&b_vec));
     PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&x_vec));
-    return {its, solve_ms.count()};
+    return {its, setup_ms.count(), solve_ms.count(), repeat_ms.count()};
   };
 
   // Jacobi-preconditioned leg: pmat == amat (PCJACOBI only needs the
   // diagonal, which the shell's MatGetDiagonal callback already supplies).
-  const auto [jacobi_its, jacobi_ms] = run(PCJACOBI, amat);
+  const auto jacobi = run(PCJACOBI, amat);
 
   // AMG-preconditioned leg: a real, host-assembled Pmat built from the same
   // coefficients (Section 5's assembleAnisotropicMat), matrix-free Amat
-  // unchanged and still CUDA-resident (PR4a's mixed mode). Pmat assembly
-  // itself is host-only work, timed separately from the (CUDA) solve.
+  // unchanged and still CUDA-resident (PR4a's mixed mode). Pmat is a host
+  // MATSEQAIJ, so GAMG's hierarchy and V-cycle run on the host and each
+  // PCApply moves the residual/correction between device and host; the AMG
+  // timings here include that transfer and are not a device-AMG measurement.
   const auto t_asm0 = high_resolution_clock::now();
   Mat pmat = assembleAnisotropicMat(n, aniso_Dx, aniso_Dy, aniso_shift);
   const auto t_asm1 = high_resolution_clock::now();
   const duration<double, std::milli> pmat_assembly_ms = t_asm1 - t_asm0;
-  const auto [amg_its, amg_ms] = run(PCGAMG, pmat);
+  const auto amg = run(PCGAMG, pmat);
 
-  EXPECT_LT(amg_its, jacobi_its);
-  Moose::out << "anisotropic CUDA (Dx/Dy=" << (aniso_Dx / aniso_Dy) << "): Jacobi " << jacobi_its
-             << " its, " << jacobi_ms << "ms | AMG (PCGAMG) " << amg_its << " its, " << amg_ms
-             << "ms solve + " << pmat_assembly_ms.count() << "ms Pmat assembly\n";
+  EXPECT_LT(amg.its, jacobi.its);
+  Moose::out << "anisotropic CUDA (Dx/Dy=" << (aniso_Dx / aniso_Dy) << "): Jacobi " << jacobi.its
+             << " its, setup " << jacobi.setup_ms << "ms, solve " << jacobi.solve_ms
+             << "ms, repeat solve " << jacobi.repeat_ms << "ms | AMG (PCGAMG) " << amg.its
+             << " its, Pmat assembly " << pmat_assembly_ms.count() << "ms, setup " << amg.setup_ms
+             << "ms, solve " << amg.solve_ms << "ms, repeat solve " << amg.repeat_ms << "ms\n";
 
   PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&pmat));
   PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&amat));
