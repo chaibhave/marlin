@@ -13,6 +13,18 @@
 \usepackage{amssymb}
 \usepackage{amsmath}
 \usepackage[normalem]{ulem}
+\usepackage{listings}
+\usepackage{graphicx}
+
+\lstset{
+  basicstyle=\fontsize{6pt}{7pt}\ttfamily,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  frame=single,
+  framerule=0.3pt,
+  rulecolor=\color{gray!40},
+}
 \tcbuselibrary{skins,breakable}
 
 \definecolor{marlinblue}{HTML}{1B4965}
@@ -675,7 +687,166 @@ either way.
 explicitly if the data says so --- this PR's job is to produce real
 numbers, not to confirm a predetermined answer).
 
-\status{proposed.}
+\textbf{Approach actually taken:} the standalone Python/\texttt{petsc4py}
+script above was abandoned in favor of a C++ unit test
+(\texttt{unit/src/PetscTorchMatrixFreeBenchmarkTest.C}) in Marlin's existing
+gtest harness, reusing the production \texttt{MooseTensor::}
+\texttt{conjugateGradientSolve} directly instead of reimplementing CG. Two
+further comparisons were added at the user's request: an anisotropic
+(ill-conditioned) case testing R7's AMG claim, and a fully assembled
+\texttt{Mat} scaling/memory sweep.
+
+\textbf{Results (2026-10-17).} All correctness tests pass on both CPU
+(macOS arm64, this machine) and CUDA (the user's machine, confirmed via a
+second run after a device-mismatch bug found in the first run was fixed
+--- see below), including the zero-copy \texttt{Vec} pointer-equality
+assertion on both devices.
+
+\textit{Matrix-free timing sweep} (CG+Jacobi, \texttt{rel\_tol}=$10^{-10}$,
+unpreconditioned stopping test on both legs; iteration counts match exactly
+at every size, confirming correctness is unaffected by which leg or
+device is used):
+
+\begin{center}
+\footnotesize
+\begin{tabular}{rrrrr}
+\toprule
+$n$ & torch-native (CPU) & PETSc (CPU, zero-copy) & torch-native (CUDA) & PETSc (CUDA, zero-copy) \\
+\midrule
+32   & 0.56 ms   & 0.74 ms   & 4.19 ms  & 4.52 ms \\
+64   & 0.94 ms   & 0.72 ms   & 4.18 ms  & 4.48 ms \\
+128  & 3.03 ms   & 2.41 ms   & 4.88 ms  & 4.47 ms \\
+256  & 10.8 ms   & 8.9 ms    & 5.06 ms  & 4.66 ms \\
+512  & 43.4 ms   & 37.3 ms   & 5.18 ms  & 6.32 ms \\
+1024 & 174.7 ms  & 148.8 ms  & 7.69 ms  & 11.08 ms \\
+2048 & 718.9 ms  & 614.5 ms  & 20.77 ms & 31.85 ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\includegraphics[width=0.95\textwidth]{figures/timing_sweep.pdf}
+\end{center}
+
+The two devices disagree on which leg wins. On CPU, PETSc's matrix-free
+shell leg is consistently 14--20\% faster than torch-native from $n=64$
+up. On CUDA, torch-native is faster from the smallest size tested, and the
+gap widens with $n$ (PETSc is $\sim$1.4$\times$ slower at $n=2048$).
+Absolute CUDA times (4--5~ms even at $n=32$, for only 32 CG iterations) are
+far above the corresponding CPU times, consistent with kernel-launch
+latency dominating at this problem scale on CUDA rather than compute
+throughput --- real hardware was needed to see this; it would not have
+been predictable from the CPU numbers alone. R6 therefore resolves
+\textit{per device}, not with one global answer: zero-copy \texttt{Vec}
+wrapping (Section~\ref{sec:soa}) works correctly on both CPU and CUDA, so
+PR3's open question is which leg to default to per device --- PETSc on
+CPU, torch-native on CUDA, per this data --- not whether PETSc's hand-off
+overhead is prohibitively high (it is not, on either device).
+
+\textit{Ill-conditioned (anisotropic, R7/PR4a) comparison} ($n=64$,
+$D_x=1$, $D_y=10^{-4}$, $D_x/D_y=10^4$, same manufactured solution and
+correctness check in both legs):
+
+\begin{center}
+\footnotesize
+\begin{tabular}{lrrrr}
+\toprule
+Preconditioner & Its.\ (CPU) & Wall-clock (CPU) & Its.\ (CUDA) & Wall-clock (CUDA) \\
+\midrule
+Jacobi (diagonal, matrix-free) & 202 & 4.56 ms & 202 & 27.26 ms \\
+AMG (\texttt{PCGAMG}, assembled \texttt{Pmat}) & 135--137 & 24.79 ms\textsuperscript{*} & 136 & 87.07 ms\textsuperscript{*} \\
+\bottomrule
+\end{tabular}
+\end{center}
+{\footnotesize \textsuperscript{*}AMG wall-clock totals \texttt{KSPSolve} time plus the one-time \texttt{Pmat} assembly cost (CPU: 24.49 + 0.30 ms; CUDA: 86.52 + 0.55 ms).}
+
+\begin{center}
+\includegraphics[width=0.95\textwidth]{figures/anisotropic_amg_vs_jacobi.pdf}
+\end{center}
+
+AMG converges in $\sim$1.5$\times$ fewer iterations than Jacobi at this
+anisotropy ratio on both devices, at the one-time cost of assembling
+\texttt{Pmat} --- concrete evidence for R7, on CPU and CUDA, that a pure
+matrix-free scalar preconditioner cannot access on its own.
+\textbf{But fewer iterations does not mean faster wall-clock time here}:
+GAMG's per-iteration cost (coarse-grid hierarchy application) is high
+enough that AMG is $\sim$5$\times$ slower in wall-clock time than Jacobi
+on both devices, despite needing $\sim$1.5$\times$ fewer iterations ---
+the iteration-count-only version of this table (previous revision) implied
+the opposite conclusion. Whether AMG is worth its iteration-count
+advantage therefore depends on whether \texttt{Pmat} can be assembled
+once and reused across many solves (Section~\ref{sec:decisions} item 3),
+not on this single-solve comparison alone; that reuse cadence is PR4a's
+design, not yet measured here.
+\textbf{Caveat found and resolved mid-verification:} the first two CUDA
+runs both reported the identical Jacobi/AMG iteration counts as the CPU
+run, because the test exercising this comparison
+(\texttt{AnisotropicAMGConvergesFasterThanJacobi}) was CPU-only
+(\texttt{VecCreateSeqWithArray}, host tensors) on both machines --- it was
+never actually exercising CUDA, despite running on the CUDA machine. A
+genuine CUDA variant, \texttt{AnisotropicCudaAMGConvergesFasterThanJacobi}
+(commit \texttt{cb9368f}), was added and run on CUDA (third CUDA run,
+reflected in the CUDA column above and the updated log at the end of this
+section). Wall-clock timing was added to both tests (commit
+\texttt{24527aa}) after noticing the iteration-count-only report could not
+show which leg is actually faster; a fourth CUDA run (2026-10-17) supplied
+the CUDA wall-clock numbers above.
+
+\textit{Assembled-\texttt{Mat} fallback scaling} (same isotropic problem as
+the timing sweep, a fully assembled \texttt{Mat} for both \texttt{Amat} and
+the Jacobi \texttt{Pmat}, CPU only --- not yet exercised on CUDA):
+
+\begin{center}
+\footnotesize
+\begin{tabular}{rrrrr}
+\toprule
+$n$ & assembly & solve & \texttt{Mat} storage (\texttt{nz\_used}) & peak RSS \\
+\midrule
+32   & 0.13 ms  & 0.15 ms   & 80 KB  & 167 MB \\
+256  & 5.2 ms   & 5.6 ms    & 5 MB   & 181 MB \\
+1024 & 72.1 ms  & 102.8 ms  & 80 MB  & 437 MB \\
+2048 & 275.2 ms & 458.9 ms  & 320 MB & 1257 MB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Iteration counts match the matrix-free legs exactly at every size, so
+assembly changes nothing about correctness or convergence here, only cost.
+At $n=2048$ the assembled matrix occupies 320~MB on its own, and
+assembly+solve together (734~ms) run slower than either matrix-free leg's
+full CPU solve (615--719~ms); peak RSS (1257~MB) exceeds both matrix-free
+legs' (1121~MB) by roughly the matrix's own storage --- direct, measured
+evidence for the matrix-free default (Section~\ref{sec:decisions}, item
+5): the assembled-\texttt{Mat} fallback's cost grows with problem size in a
+way the matrix-free legs' does not, on top of being slower outright on
+this CPU problem.
+
+\textbf{Fix found and applied mid-verification:} the first CUDA run
+(before the fixes above) failed both new CUDA-only tests with a device
+mismatch (\texttt{conv2d}'s weight tensor was unconditionally CPU-resident
+in \texttt{PeriodicStencilOperator}, so applying it to a CUDA input threw).
+Fixed by giving the stencil operator classes an optional \texttt{device}
+parameter (commit \texttt{19341d7}); a second CUDA run with the fix passed
+all 8 tests. This is recorded here, rather than only in commit history,
+because it is exactly the kind of PETSc/torch hand-off correctness issue
+Section~\ref{sec:soa}'s zero-copy requirement is meant to get right, and it
+only surfaced once real CUDA hardware exercised the code.
+
+The full raw logs from both machines are reproduced below for direct
+inspection, rather than only the extracted tables above.
+
+\lstinputlisting[caption={Full CPU run log (\texttt{petsc\_torch\_benchmark\_cpu.log}), re-run with wall-clock timing on the anisotropic tests, 6/6 tests passing.}]{logs/petsc_torch_benchmark_cpu.log}
+
+\lstinputlisting[caption={Full CUDA run log (\texttt{petsc\_torch\_benchmark\_cuda.log}), fourth run --- wall-clock timing added to both anisotropic AMG-vs-Jacobi tests, all 9/9 tests passing.}]{logs/petsc_torch_benchmark_cuda.log}
+
+\status{implemented and verified on both CPU and CUDA, all 9 tests,
+2026-10-17 (commits \texttt{12016ae}, \texttt{41c2e31}, \texttt{19341d7},
+\texttt{cb9368f}, \texttt{24527aa} on branch \texttt{petsc\_torch\_benchmark}).
+R6 and R7 are both now evidenced on CPU and CUDA, including wall-clock
+time (not just iteration counts) for the anisotropic AMG-vs-Jacobi
+comparison. Remaining before this PR can be marked \texttt{verified} in
+the status-tracking table: the independent-reviewer-agent pass
+(Section~\ref{sec:gates}) has not yet been run on this diff.}
 
 \pr{2}{DMDA/Decomposition Compatibility Spike}
 \textbf{Scope:} Isolated, throwaway-if-needed investigation + the minimal
@@ -890,7 +1061,7 @@ PR & Deliverable & Status & Verification attached? \\
 \endhead
 PR0 & LinearFDOperator mixin + Laplacian retrofit & proposed & --- \\
 PR1 & BC TensorComputes, ghost-fill & proposed & --- \\
-PR1a & Torch-native vs.\ PETSc matrix-free benchmark & proposed & --- \\
+PR1a & Torch-native vs.\ PETSc matrix-free benchmark & implemented, CPU+CUDA verified & CPU+CUDA logs and tables in Section~\ref{sec:roadmap} (PR1a) \\
 PR2 & DMDA/decomposition compatibility spike & proposed & --- \\
 PR3 & PetscFDSolverBase, single field, matrix-free & proposed & --- \\
 PR4 & BC terms in matrix-free operator application & proposed & --- \\
