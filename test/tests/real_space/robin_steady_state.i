@@ -38,16 +38,25 @@
   ymax = 1
 []
 
+[Functions]
+  [u_ic_func]
+    type = ParsedFunction
+    expression = '0.5'
+  []
+  [u_exact_func]
+    type = ParsedFunction
+    expression = '1 + x / 3'
+  []
+[]
+
 [TensorComputes]
   [Initialize]
     [u_ic]
-      type = ParsedCompute
+      # Not the steady solution (constant, no x-dependence) and not matching the BCs
+      # pointwise.
+      type = MooseFunctionTensor
       buffer = u
-      # Not the steady solution (constant, no x-dependence) and not matching the
-      # BCs pointwise; the 0.001*y term is required by extra_symbols (every spatial
-      # axis must appear in the expression for real-space ghost padding).
-      expression = '0.5 + 0.001*y'
-      extra_symbols = true
+      function = u_ic_func
     []
   []
   [BCs]
@@ -74,15 +83,9 @@
       buffer = dudt
     []
     [u_exact]
-      type = ParsedCompute
+      type = MooseFunctionTensor
       buffer = u_exact
-      # 0.0001*y, not 0*y: a zero-coefficient y term here causes ParsedCompute to
-      # silently collapse the Y axis (produces an all-zero field except where some
-      # other term happens to carry y-dependence), rather than erroring the way the
-      # scalar-IC case does (see semi_infinite_diffusion.i's comment on the related
-      # "0 + 0*y"/"0*x" pitfall) -- confirmed directly via an isolated debug input.
-      expression = '1 + x / 3 + 0.0001*y'
-      extra_symbols = true
+      function = u_exact_func
     []
     [diff]
       type = ParsedCompute

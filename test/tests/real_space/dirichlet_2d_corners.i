@@ -16,22 +16,10 @@
 # this test used that profile and produced a large, correct-but-misleading
 # Laplacian mismatch at the corners from the BC/IC inconsistency itself, not
 # from ghost-fill ordering.) With this corrected, face-compatible profile, the
-# discrete Laplacian should again be exactly zero everywhere, including the
-# four corner-adjacent cells, confirming the two-non-periodic-axis ghost-fill
-# path (not exercised by any other real_space test, which are periodic on at
-# least one axis) is correct at the corners.
-#
-# In practice the recorded gold values are NOT exact roundoff zero: the
-# 0.0001*y term needed to avoid the ParsedCompute collapse-to-scalar pitfall
-# (see above) means u is not EXACTLY the steady profile the BCs imply (which
-# has no y-dependence), so TensorDirichletBC's uniform (y-independent) ghost
-# value disagrees with the interior cell's 0.0001*y term by a growing amount
-# as y increases away from y=0, producing an O(0.0001*y/dx^2) perturbation at
-# the left/right boundary-adjacent columns -- exactly the same effect already
-# documented and accepted in dirichlet_laplacian_check.i for the 1D case. The
-# deep-interior cells (away from any boundary-adjacent column/row) remain at
-# float32 roundoff, confirmed directly via the XDMF field dump used to derive
-# this gold value.
+# discrete Laplacian should be exactly zero everywhere, including the four
+# corner-adjacent cells, confirming the two-non-periodic-axis ghost-fill path
+# (not exercised by any other real_space test, which are periodic on at least
+# one axis) is correct at the corners.
 [Domain]
   dim = 2
   nx = 20
@@ -43,19 +31,26 @@
   ymax = 1
 []
 
+[Functions]
+  [u_func]
+    type = ParsedFunction
+    expression = '1 + 2 * x'
+  []
+[]
+
 [TensorComputes]
   [Initialize]
     [u_ic]
-      type = ParsedCompute
-      buffer = u
       # Exactly the steady profile implied by the four BCs below (no
-      # y-dependence), so the discrete Laplacian is checked instantaneously,
-      # no time-stepping needed (cf. dirichlet_laplacian_check.i for the
-      # companion periodic-in-y 1D case). 0.0001*y, not 0*y: see
-      # robin_steady_state.i's comment on the zero-coefficient-collapses-the-
-      # axis ParsedCompute pitfall.
-      expression = '1 + 2 * x + 0.0001 * y'
-      extra_symbols = true
+      # y-dependence), so the discrete Laplacian is checked instantaneously, no
+      # time-stepping needed (cf. dirichlet_laplacian_check.i for the companion
+      # periodic-in-y 1D case). MooseFunctionTensor evaluates this pointwise (no
+      # symbolic simplification), so the profile can be written exactly, with no
+      # perturbation term needed to work around ParsedCompute's spatial-axis
+      # requirement.
+      type = MooseFunctionTensor
+      buffer = u
+      function = u_func
     []
   []
   [BCs]

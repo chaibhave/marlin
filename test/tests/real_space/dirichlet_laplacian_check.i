@@ -10,27 +10,27 @@
   ymax = 1
 []
 
+[Functions]
+  [u_func]
+    type = ParsedFunction
+    expression = '1 + 2 * x'
+  []
+[]
+
 [TensorComputes]
   [Initialize]
     [u_ic]
-      type = ParsedCompute
+      # u = 1 + 2*x satisfies the Dirichlet values below exactly, including on the two
+      # boundary-adjacent rows, so the discrete Laplacian should be exactly zero at
+      # roundoff everywhere, instantaneously (no time-stepping). MooseFunctionTensor
+      # evaluates the function pointwise (no symbolic simplification), so an exact,
+      # purely x-dependent profile can be used directly here, unlike ParsedCompute's
+      # expression parser, which collapses a constant/zero-coefficient term on a
+      # required spatial axis (see dirichlet_linear.i's companion relaxation test,
+      # which still uses ParsedCompute since its IC is deliberately y-dependent).
+      type = MooseFunctionTensor
       buffer = u
-      # u = 1 + 2*x satisfies the Dirichlet values below exactly on the boundary faces
-      # themselves (the BCs do not depend on y). The 0.001*y term is needed only because
-      # extra_symbols requires every spatial axis to appear in the expression (real-space
-      # ghost padding needs it); it means the field is not EXACTLY the steady solution the
-      # BCs imply (which has no y-dependence), so the discrete Laplacian is NOT exactly
-      # zero at the two boundary-adjacent x-rows, instantaneously (no time-stepping): since
-      # TensorDirichletBC clips the ghost value to the uniform boundary value regardless of
-      # y while the interior cell carries the 0.001*y term, the ghost-fill mismatch
-      # introduces an O(0.001*y/dx^2) perturbation there. This is expected, not a defect --
-      # the gold file records this derived nonzero value (max/min_lap = +/-0.732), not an
-      # assumed roundoff-zero. Deep interior cells and the periodic Y ghosts are unaffected
-      # and stay at roundoff; see dirichlet_linear.i for the complementary test where the
-      # IC does NOT match the BCs and the field is checked to relax to the true steady
-      # state (u=1+2*x) via time-stepping instead.
-      expression = '1 + 2*x + 0.001*y'
-      extra_symbols = true
+      function = u_func
     []
   []
   [BCs]

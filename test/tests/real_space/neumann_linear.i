@@ -20,15 +20,23 @@
   ymax = 1
 []
 
+[Functions]
+  [u_ic_func]
+    type = ParsedFunction
+    expression = '0.5'
+  []
+  [u_exact_func]
+    type = ParsedFunction
+    expression = '1 + 2 * x'
+  []
+[]
+
 [TensorComputes]
   [Initialize]
     [u_ic]
-      type = ParsedCompute
+      type = MooseFunctionTensor
       buffer = u
-      # 0.0001*y (not 0*y): see robin_steady_state.i's comment on the
-      # zero-coefficient-collapses-the-axis ParsedCompute pitfall.
-      expression = '0.5 + 0.0001 * y'
-      extra_symbols = true
+      function = u_ic_func
     []
   []
   [BCs]
@@ -52,10 +60,9 @@
       buffer = dudt
     []
     [u_exact]
-      type = ParsedCompute
+      type = MooseFunctionTensor
       buffer = u_exact
-      expression = '1 + 2 * x + 0.0001 * y'
-      extra_symbols = true
+      function = u_exact_func
     []
     [diff]
       type = ParsedCompute

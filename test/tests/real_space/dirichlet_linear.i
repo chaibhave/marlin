@@ -10,19 +10,26 @@
   ymax = 1
 []
 
+[Functions]
+  [u_ic_func]
+    type = ParsedFunction
+    expression = '1 + 2 * x + 0.001 * y'
+  []
+[]
+
 [TensorComputes]
   [Initialize]
     [u_ic]
-      type = ParsedCompute
-      buffer = u
       # Start from a field that is NOT the steady solution and does not match the
-      # Dirichlet BCs below pointwise (it depends weakly on y, which the BCs do not).
-      # extra_symbols requires every spatial axis to appear in the expression (real-space
-      # ghost padding needs it), hence the small 0.001*y term. The point of this test is
-      # that pure diffusion under the Dirichlet BCs should erase the y-dependence and the
-      # mismatch, driving u toward the exact steady profile u = 1 + 2*x, regardless of IC.
-      expression = '1 + 2*x + 0.001*y'
-      extra_symbols = true
+      # Dirichlet BCs below pointwise (it depends on y, which the BCs do not).
+      # MooseFunctionTensor evaluates this pointwise (no symbolic simplification), so
+      # the y-dependence here is a real part of the IC, not a workaround for a parser
+      # limitation. The point of this test is that pure diffusion under the Dirichlet
+      # BCs should erase the y-dependence and the mismatch, driving u toward the exact
+      # steady profile u = 1 + 2*x, regardless of IC.
+      type = MooseFunctionTensor
+      buffer = u
+      function = u_ic_func
     []
   []
   [BCs]
