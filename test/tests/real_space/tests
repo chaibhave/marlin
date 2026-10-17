@@ -88,6 +88,26 @@
     []
   []
 
+  [neumann_bc]
+    issues = '#122'
+    design = TensorNeumannBC.md
+    requirement = 'The system shall be able to apply a Neumann boundary condition in real space '
+    [conservation]
+      type = CSVDiff
+      input = neumann_conservation.i
+      csvdiff = neumann_conservation_out.csv
+      compute_devices = 'cpu cuda mps xpu'
+      detail = 'and conserve the total integral of a field under zero-flux boundary conditions on all non-periodic faces, from a non-uniform initial condition.'
+    []
+    [linear]
+      type = CSVDiff
+      input = neumann_linear.i
+      csvdiff = neumann_linear_out.csv
+      compute_devices = 'cpu cuda mps xpu'
+      detail = 'and relax an initial condition toward the exact linear steady-state profile implied by a Dirichlet condition on one face and a nonzero-flux Neumann condition on the other.'
+    []
+  []
+
   [robin_bc]
     issues = '#122'
     design = TensorRobinBC.md
