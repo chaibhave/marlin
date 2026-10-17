@@ -35,10 +35,8 @@ public:
    * drift apart. No MOOSE/TensorProblem dependency, so it is directly
    * unit-testable.
    */
-  static std::vector<FDStencilEntry> buildStencil(unsigned int dim,
-                                                   bool wide,
-                                                   const std::vector<Real> & grid_spacing,
-                                                   Real factor);
+  static std::vector<FDStencilEntry>
+  buildStencil(unsigned int dim, bool wide, const std::vector<Real> & grid_spacing, Real factor);
 
 protected:
   const unsigned int _radius;

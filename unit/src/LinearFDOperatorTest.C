@@ -23,8 +23,7 @@ namespace
 // for the 5-pt stencil), independent of the convolution-kernel code path in
 // computeBuffer().
 Real
-applyStencilToQuadratic(const std::vector<FDStencilEntry> & stencil,
-                        const std::vector<Real> & dx)
+applyStencilToQuadratic(const std::vector<FDStencilEntry> & stencil, const std::vector<Real> & dx)
 {
   Real total = 0.0;
   for (const auto & entry : stencil)
