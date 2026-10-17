@@ -428,10 +428,12 @@ constexpr double aniso_shift = 1.0e-3;
 class AnisotropicStencilOperator
 {
 public:
-  AnisotropicStencilOperator(int64_t n, double Dx, double Dy, double shift)
+  AnisotropicStencilOperator(
+      int64_t n, double Dx, double Dy, double shift, torch::Device device = torch::kCPU)
     : _n(n), _Dx(Dx), _Dy(Dy), _shift(shift)
   {
-    _kernel = torch::zeros({1, 1, 3, 3}, torch::kDouble);
+    _kernel =
+        torch::zeros({1, 1, 3, 3}, torch::TensorOptions().dtype(torch::kDouble).device(device));
     _kernel[0][0][1][1] = 2.0 * (_Dx + _Dy);
     _kernel[0][0][0][1] = -_Dy;
     _kernel[0][0][2][1] = -_Dy;
@@ -802,6 +804,48 @@ cudaShellGetDiagonal(Mat mat, Vec diag)
   return PETSC_SUCCESS;
 }
 
+/// CUDA counterparts of Section 5's anisoShellMatMult/anisoShellGetDiagonal,
+/// identical in structure to cudaShellMatMult/cudaShellGetDiagonal above but
+/// operating on AnisoShellContext (Section 5) instead of ShellContext.
+PetscErrorCode
+cudaAnisoShellMatMult(Mat mat, Vec x, Vec y)
+{
+  AnisoShellContext * ctx;
+  PetscCallAbort(PETSC_COMM_SELF, MatShellGetContext(mat, &ctx));
+
+  PetscStreamGuard stream_guard;
+
+  const PetscScalar * x_arr;
+  PetscScalar * y_arr;
+  PetscCallAbort(PETSC_COMM_SELF, VecCUDAGetArrayRead(x, &x_arr));
+  PetscCallAbort(PETSC_COMM_SELF, VecCUDAGetArrayWrite(y, &y_arr));
+
+  auto x_tensor = torch::from_blob(const_cast<PetscScalar *>(x_arr),
+                                   {ctx->n * ctx->n},
+                                   torch::TensorOptions()
+                                       .dtype(torch::kDouble)
+                                       .device(torch::kCUDA, c10::cuda::current_device()));
+  auto result = (*ctx->op)(x_tensor);
+  cudaMemcpyAsync(y_arr,
+                  result.data_ptr<double>(),
+                  ctx->n * ctx->n * sizeof(double),
+                  cudaMemcpyDeviceToDevice,
+                  c10::cuda::getCurrentCUDAStream().stream());
+
+  PetscCallAbort(PETSC_COMM_SELF, VecCUDARestoreArrayRead(x, &x_arr));
+  PetscCallAbort(PETSC_COMM_SELF, VecCUDARestoreArrayWrite(y, &y_arr));
+  return PETSC_SUCCESS;
+}
+
+PetscErrorCode
+cudaAnisoShellGetDiagonal(Mat mat, Vec diag)
+{
+  AnisoShellContext * ctx;
+  PetscCallAbort(PETSC_COMM_SELF, MatShellGetContext(mat, &ctx));
+  PetscCallAbort(PETSC_COMM_SELF, VecSet(diag, ctx->diag_value));
+  return PETSC_SUCCESS;
+}
+
 } // namespace
 
 TEST(PetscTorchMatrixFreeBenchmarkTest, CudaLegZeroCopyVecMatchesTorchNativeLeg)
@@ -967,6 +1011,94 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
     PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&x_vec));
     PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&mat));
   }
+}
+
+// CUDA counterpart of Section 5's AnisotropicAMGConvergesFasterThanJacobi:
+// the same ill-conditioned (anisotropic) comparison, with the matrix-free
+// Amat's shell callbacks running on CUDA (cudaAnisoShellMatMult/
+// cudaAnisoShellGetDiagonal above) and b/x as zero-copy CUDA Vecs, so R7's
+// AMG-vs-Jacobi claim is checked on-device rather than only on CPU. Pmat
+// (feeding PCGAMG) stays a host-assembled Mat, matching Section 5 and PR4a's
+// mixed-mode design (only Amat and the solve Vecs are zero-copy/on-device;
+// Pmat's one-off assembly cost is paid on the host either way).
+TEST(PetscTorchMatrixFreeBenchmarkTest, AnisotropicCudaAMGConvergesFasterThanJacobi)
+{
+  ASSERT_TRUE(torch::cuda::is_available())
+      << "PETSC_HAVE_CUDA and libtorch CUDA headers are both present at compile time, but no "
+         "CUDA device is available at runtime on this machine.";
+
+  const int64_t n = 64;
+  const auto cuda_opts = torch::TensorOptions().dtype(torch::kDouble).device(torch::kCUDA);
+
+  AnisotropicStencilOperator A(n, aniso_Dx, aniso_Dy, aniso_shift, torch::kCUDA);
+  AnisoShellContext ctx{&A, n, A.diagValue()};
+
+  const auto x_exact = torch::randn({n * n}, cuda_opts);
+  auto b_tensor = A(x_exact).contiguous();
+
+  Mat amat;
+  PetscCallAbort(PETSC_COMM_SELF,
+                 MatCreateShell(PETSC_COMM_SELF, n * n, n * n, n * n, n * n, &ctx, &amat));
+  PetscCallAbort(PETSC_COMM_SELF,
+                 MatShellSetOperation(amat, MATOP_MULT, (void (*)(void))cudaAnisoShellMatMult));
+  PetscCallAbort(
+      PETSC_COMM_SELF,
+      MatShellSetOperation(amat, MATOP_GET_DIAGONAL, (void (*)(void))cudaAnisoShellGetDiagonal));
+  PetscCallAbort(PETSC_COMM_SELF, MatShellSetVecType(amat, VECSEQCUDA));
+
+  auto run = [&](PCType pc_type, Mat pmat) -> PetscInt
+  {
+    auto x_tensor = torch::zeros({n * n}, cuda_opts);
+    Vec b_vec, x_vec;
+    PetscCallAbort(
+        PETSC_COMM_SELF,
+        VecCreateSeqCUDAWithArray(PETSC_COMM_SELF, 1, n * n, b_tensor.data_ptr<double>(), &b_vec));
+    PetscCallAbort(
+        PETSC_COMM_SELF,
+        VecCreateSeqCUDAWithArray(PETSC_COMM_SELF, 1, n * n, x_tensor.data_ptr<double>(), &x_vec));
+
+    KSP ksp;
+    PetscCallAbort(PETSC_COMM_SELF, KSPCreate(PETSC_COMM_SELF, &ksp));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetOperators(ksp, amat, pmat));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetType(ksp, KSPCG));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetNormType(ksp, KSP_NORM_UNPRECONDITIONED));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetTolerances(ksp, rel_tol, 0.0, PETSC_DEFAULT, 10 * n * n));
+
+    PC pc;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetPC(ksp, &pc));
+    PetscCallAbort(PETSC_COMM_SELF, PCSetType(pc, pc_type));
+
+    PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
+    PetscInt its;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetIterationNumber(ksp, &its));
+
+    KSPConvergedReason reason;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetConvergedReason(ksp, &reason));
+    EXPECT_GT(reason, 0) << "KSP (" << pc_type << ") failed to converge";
+    EXPECT_NEAR((x_tensor - x_exact).norm().item<double>(), 0.0, 1e-5);
+
+    PetscCallAbort(PETSC_COMM_SELF, KSPDestroy(&ksp));
+    PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&b_vec));
+    PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&x_vec));
+    return its;
+  };
+
+  // Jacobi-preconditioned leg: pmat == amat (PCJACOBI only needs the
+  // diagonal, which the shell's MatGetDiagonal callback already supplies).
+  const PetscInt jacobi_its = run(PCJACOBI, amat);
+
+  // AMG-preconditioned leg: a real, host-assembled Pmat built from the same
+  // coefficients (Section 5's assembleAnisotropicMat), matrix-free Amat
+  // unchanged and still CUDA-resident (PR4a's mixed mode).
+  Mat pmat = assembleAnisotropicMat(n, aniso_Dx, aniso_Dy, aniso_shift);
+  const PetscInt amg_its = run(PCGAMG, pmat);
+
+  EXPECT_LT(amg_its, jacobi_its);
+  Moose::out << "anisotropic CUDA (Dx/Dy=" << (aniso_Dx / aniso_Dy) << "): Jacobi " << jacobi_its
+             << " its | AMG (PCGAMG) " << amg_its << " its\n";
+
+  PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&pmat));
+  PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&amat));
 }
 
 #endif // MARLIN_PETSC_TORCH_CUDA_LEG
