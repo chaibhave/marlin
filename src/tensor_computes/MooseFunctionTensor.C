@@ -69,4 +69,36 @@ MooseFunctionTensor::computeBuffer()
   }
 
   _u = buffer.to(MooseTensor::floatTensorOptions());
+
+  // In real-space mode, pad with ghost layers so this buffer's shape matches every other
+  // real-space buffer's (TensorProblem::getLocalTensorShape()); mirrors ParsedCompute's
+  // identical final padding step (ParsedCompute::computeBuffer()). The padded values are
+  // placeholders only -- TensorProblem::exchangeGhostLayers() overwrites them (periodic
+  // wraparound or a TensorBoundaryCondition's fillGhostCells()) before any ghosted read.
+  if (_domain.isRealSpaceMode())
+  {
+    const auto desired = _tensor_problem.getLocalTensorShape({});
+    std::vector<int64_t> pad;
+    pad.reserve(_dim * 2);
+    bool needs_pad = false;
+    for (int d = static_cast<int>(_dim) - 1; d >= 0; --d)
+    {
+      const auto target = desired[d];
+      const auto cur = n[d];
+      const auto left_p = (target - cur) / 2;
+      const auto right_p = target - cur - left_p;
+      if (left_p > 0 || right_p > 0)
+        needs_pad = true;
+      pad.push_back(left_p);
+      pad.push_back(right_p);
+    }
+    if (needs_pad)
+      _u = torch::constant_pad_nd(_u, pad, 0.0);
+  }
+}
+
+void
+MooseFunctionTensor::realSpaceComputeBuffer()
+{
+  computeBuffer();
 }
