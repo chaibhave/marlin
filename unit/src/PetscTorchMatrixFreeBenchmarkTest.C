@@ -20,6 +20,31 @@
 #include <chrono>
 #include <sys/resource.h>
 
+// Section 7 (CUDA leg) needs both PETSc's CUDA Vec API and libtorch's CUDA
+// stream-interop headers. Guard on both independently: PetscDefined(HAVE_CUDA)
+// is PETSc's own compile-time flag (false here: this machine's conda PETSc is
+// CPU-only), and the __has_include check detects whether libtorch was built
+// with CUDA (ATen/cuda/CUDAConfig.h only exists in a CUDA-enabled build; this
+// machine's libtorch is CPU-only, so neither branch compiles here). Combining
+// both avoids compiling PETSc-CUDA calls against a CPU-only libtorch or vice
+// versa, either of which would fail to link.
+#if defined(__has_include)
+#if __has_include(<ATen/cuda/CUDAConfig.h>)
+#define MARLIN_TORCH_CUDA_AVAILABLE 1
+#endif
+#endif
+#if !defined(MARLIN_TORCH_CUDA_AVAILABLE)
+#define MARLIN_TORCH_CUDA_AVAILABLE 0
+#endif
+#if PetscDefined(HAVE_CUDA) && MARLIN_TORCH_CUDA_AVAILABLE
+#define MARLIN_PETSC_TORCH_CUDA_LEG 1
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <petscdevice_cuda.h>
+#else
+#define MARLIN_PETSC_TORCH_CUDA_LEG 0
+#endif
+
 namespace
 {
 /// Process peak resident set size, in KB, for the memory-scaling benchmarks
@@ -650,3 +675,293 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_AssembledMatScalingSweep)
     PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&amat));
   }
 }
+
+// SECTION 7: CUDA leg - zero-copy PETSc Vec over a CUDA tensor's device
+// pointer, exercised only when both PETSc (PetscDefined(HAVE_CUDA)) and
+// libtorch (MARLIN_TORCH_CUDA_AVAILABLE, Sec. 0 above) were built with CUDA
+// support, which is NOT the case for either dependency on the development
+// machine this file was authored and tested on (confirmed: no
+// ATen/cuda/CUDAConfig.h in this machine's libtorch, no CUDA petscvariables
+// in this machine's conda PETSc). This section has therefore NOT been
+// compiled or run anywhere; it is written from PETSc's documented API
+// contracts (manual pages for VecCreateSeqCUDAWithArray, VecCUDAGetArray/
+// VecCUDARestoreArray, MatShellSetVecType, PetscGetCurrentCUDAStream) and
+// needs verification on an actual CUDA-enabled build before it can be
+// trusted. See the plan's "Running on CUDA" instructions for how to get
+// that build and report back a reviewable log.
+//
+// Design, to avoid wasting memory or adding synchronization overhead beyond
+// what PETSc's own Vec/KSP machinery already does:
+//  - b/x Vecs are built via VecCreateSeqCUDAWithArray wrapping the CUDA
+//    tensor's own data_ptr() directly (zero-copy: no host round-trip, no
+//    separate PETSc-owned device allocation), mirroring the CPU zero-copy
+//    leg's VecCreateSeqWithArray in Section 3.
+//  - The shell's MatMult callback uses VecCUDAGetArray/VecCUDARestoreArray
+//    (not VecGetArray/VecRestoreArray): these hand back the device pointer
+//    directly with no implicit device<->host copy, whereas VecGetArray on a
+//    CUDA Vec would force a device-to-host sync every iteration - exactly
+//    the per-iteration overhead this design avoids.
+//  - MatShellSetVecType(mat, VECSEQCUDA) tells KSP to allocate its own
+//    internal CG work vectors (search direction, residual, etc., which the
+//    user-level code never sees) as CUDA Vecs too. Without this, KSP
+//    defaults those to the Vec type of the Amat/Pmat arguments' *container*
+//    type, and a MatCreateShell's default is VECSTANDARD (host), which would
+//    silently force a device<->host copy on every KSP-internal vector
+//    operation even though the user-supplied b/x Vecs are on-device.
+//  - torch's own CUDA kernels, invoked from inside the MatMult callback via
+//    the identical stencil operator functor used by the CPU legs, run on
+//    PETSc's current CUDA stream (via PetscGetCurrentCUDAStream +
+//    c10::cuda::CUDAStreamGuard) rather than torch's own default stream.
+//    Without this, torch's kernel launches and PETSc's own CUDA kernels
+//    (dot products, AXPY, norms inside KSPSolve) would run on two unrelated
+//    streams with no implicit ordering between them, forcing either a race
+//    or a cudaDeviceSynchronize() call every iteration to serialize them -
+//    exactly the overhead this design is written to avoid. Running torch on
+//    PETSc's own stream keeps everything in one stream's natural ordering
+//    with no explicit sync needed.
+#if MARLIN_PETSC_TORCH_CUDA_LEG
+
+namespace
+{
+
+/// RAII guard making torch's CUDA kernels (for the duration of the guard's
+/// lifetime) run on PETSc's current CUDA stream, so a MatMult callback's
+/// torch:: calls interleave correctly with PETSc's own CUDA work (dot
+/// products, AXPY, norms in KSPSolve) without an explicit
+/// cudaDeviceSynchronize() every iteration.
+class PetscStreamGuard
+{
+public:
+  PetscStreamGuard()
+  {
+    cudaStream_t petsc_stream;
+    PetscCallAbort(PETSC_COMM_SELF, PetscGetCurrentCUDAStream(&petsc_stream));
+    const auto device_index = c10::cuda::current_device();
+    _guard = std::make_unique<c10::cuda::CUDAStreamGuard>(
+        c10::cuda::getStreamFromExternal(petsc_stream, device_index));
+  }
+
+private:
+  std::unique_ptr<c10::cuda::CUDAStreamGuard> _guard;
+};
+
+PetscErrorCode
+cudaShellMatMult(Mat mat, Vec x, Vec y)
+{
+  ShellContext * ctx;
+  PetscCallAbort(PETSC_COMM_SELF, MatShellGetContext(mat, &ctx));
+
+  PetscStreamGuard stream_guard;
+
+  // VecCUDAGetArray/VecCUDARestoreArray hand back the device pointer with no
+  // implicit device<->host copy - unlike VecGetArray on a CUDA Vec, which
+  // would force one. x's device data is read, not modified, by the stencil
+  // action, but there is no VecCUDAGetArrayRead counterpart used here
+  // because PETSc's const-correctness for the read-only overload still
+  // requires the same device-resident buffer; VecCUDAGetArray is used
+  // symmetrically for both x and y for clarity, matching the CPU leg's
+  // VecGetArrayRead/VecGetArray split in spirit, not in the exact overload.
+  const PetscScalar * x_arr;
+  PetscScalar * y_arr;
+  PetscCallAbort(PETSC_COMM_SELF, VecCUDAGetArrayRead(x, &x_arr));
+  PetscCallAbort(PETSC_COMM_SELF, VecCUDAGetArrayWrite(y, &y_arr));
+
+  auto x_tensor = torch::from_blob(const_cast<PetscScalar *>(x_arr),
+                                   {ctx->n * ctx->n},
+                                   torch::TensorOptions()
+                                       .dtype(torch::kDouble)
+                                       .device(torch::kCUDA, c10::cuda::current_device()));
+  auto result = (*ctx->op)(x_tensor);
+  // result is a torch-allocated CUDA tensor (the stencil op's conv2d output,
+  // not an alias of x_arr/y_arr), so this device-to-device copy is required
+  // regardless of the Vec hand-off being zero-copy; it is a cudaMemcpyAsync
+  // on PETSc's stream (via the guard above), not a host round-trip.
+  cudaMemcpyAsync(y_arr,
+                  result.data_ptr<double>(),
+                  ctx->n * ctx->n * sizeof(double),
+                  cudaMemcpyDeviceToDevice,
+                  c10::cuda::getCurrentCUDAStream().stream());
+
+  PetscCallAbort(PETSC_COMM_SELF, VecCUDARestoreArrayRead(x, &x_arr));
+  PetscCallAbort(PETSC_COMM_SELF, VecCUDARestoreArrayWrite(y, &y_arr));
+  return PETSC_SUCCESS;
+}
+
+PetscErrorCode
+cudaShellGetDiagonal(Mat mat, Vec diag)
+{
+  ShellContext * ctx;
+  PetscCallAbort(PETSC_COMM_SELF, MatShellGetContext(mat, &ctx));
+  PetscCallAbort(PETSC_COMM_SELF, VecSet(diag, ctx->diag_value));
+  return PETSC_SUCCESS;
+}
+
+} // namespace
+
+TEST(PetscTorchMatrixFreeBenchmarkTest, CudaLegZeroCopyVecMatchesTorchNativeLeg)
+{
+  ASSERT_TRUE(torch::cuda::is_available())
+      << "PETSC_HAVE_CUDA and libtorch CUDA headers are both present at compile time, but no "
+         "CUDA device is available at runtime on this machine.";
+
+  const int64_t n = 16;
+  const auto cuda_opts = torch::TensorOptions().dtype(torch::kDouble).device(torch::kCUDA);
+
+  PeriodicStencilOperator A(n, shift);
+  ShellContext ctx{&A, n, 4.0 + shift};
+
+  // A(x_exact) is computed on CPU (PeriodicStencilOperator doesn't care
+  // which device its input tensor lives on, but the manufactured-solution
+  // setup here deliberately stays off the timed/measured path), then moved
+  // to CUDA as the actual b for both legs.
+  const auto x_exact_cpu = torch::randn({n * n}, torch::kDouble);
+  auto b_tensor = A(x_exact_cpu).contiguous().to(cuda_opts);
+  const auto x_exact = x_exact_cpu.to(cuda_opts);
+
+  Mat mat;
+  PetscCallAbort(PETSC_COMM_SELF,
+                 MatCreateShell(PETSC_COMM_SELF, n * n, n * n, n * n, n * n, &ctx, &mat));
+  PetscCallAbort(PETSC_COMM_SELF,
+                 MatShellSetOperation(mat, MATOP_MULT, (void (*)(void))cudaShellMatMult));
+  PetscCallAbort(
+      PETSC_COMM_SELF,
+      MatShellSetOperation(mat, MATOP_GET_DIAGONAL, (void (*)(void))cudaShellGetDiagonal));
+  // Without this, KSP's own internally allocated work vectors (search
+  // direction, residual, etc.) default to a host Vec type, forcing a
+  // device<->host copy on every KSP-internal vector op even though the
+  // user-supplied b/x Vecs below are on-device.
+  PetscCallAbort(PETSC_COMM_SELF, MatShellSetVecType(mat, VECSEQCUDA));
+
+  Vec b_vec, x_vec;
+  PetscCallAbort(
+      PETSC_COMM_SELF,
+      VecCreateSeqCUDAWithArray(PETSC_COMM_SELF, 1, n * n, b_tensor.data_ptr<double>(), &b_vec));
+
+  auto x_tensor = torch::zeros({n * n}, cuda_opts);
+  PetscCallAbort(
+      PETSC_COMM_SELF,
+      VecCreateSeqCUDAWithArray(PETSC_COMM_SELF, 1, n * n, x_tensor.data_ptr<double>(), &x_vec));
+
+  // Zero-copy check: PETSc's Vec must resolve to the same device memory as
+  // the tensor's own buffer, not a copy - the CUDA analog of the CPU leg's
+  // VecGetArray pointer-equality check in Section 3.
+  PetscScalar * vec_array;
+  PetscCallAbort(PETSC_COMM_SELF, VecCUDAGetArray(x_vec, &vec_array));
+  EXPECT_EQ(static_cast<void *>(vec_array), static_cast<void *>(x_tensor.data_ptr<double>()));
+  PetscCallAbort(PETSC_COMM_SELF, VecCUDARestoreArray(x_vec, &vec_array));
+
+  KSP ksp;
+  PetscCallAbort(PETSC_COMM_SELF, KSPCreate(PETSC_COMM_SELF, &ksp));
+  PetscCallAbort(PETSC_COMM_SELF, KSPSetOperators(ksp, mat, mat));
+  PetscCallAbort(PETSC_COMM_SELF, KSPSetType(ksp, KSPCG));
+  PetscCallAbort(PETSC_COMM_SELF, KSPSetNormType(ksp, KSP_NORM_UNPRECONDITIONED));
+  PetscCallAbort(PETSC_COMM_SELF, KSPSetTolerances(ksp, rel_tol, 0.0, PETSC_DEFAULT, n * n));
+  PC pc;
+  PetscCallAbort(PETSC_COMM_SELF, KSPGetPC(ksp, &pc));
+  PetscCallAbort(PETSC_COMM_SELF, PCSetType(pc, PCJACOBI));
+
+  PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
+
+  PetscInt petsc_iterations;
+  PetscCallAbort(PETSC_COMM_SELF, KSPGetIterationNumber(ksp, &petsc_iterations));
+
+  // x_vec aliases x_tensor's device buffer, so the solution is already in
+  // x_tensor. .item<double>() below forces one host sync for the test
+  // assertion itself (not part of the solve being measured).
+  EXPECT_NEAR((x_tensor - x_exact).norm().item<double>(), 0.0, 1e-6);
+
+  const auto [x_torch, torch_iterations, torch_norm] = solveTorchNative(n, b_tensor);
+  EXPECT_NEAR((x_tensor - x_torch).norm().item<double>(), 0.0, 1e-6);
+  EXPECT_NEAR(static_cast<double>(petsc_iterations), static_cast<double>(torch_iterations), 2.0);
+  (void)torch_norm;
+
+  PetscCallAbort(PETSC_COMM_SELF, KSPDestroy(&ksp));
+  PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&b_vec));
+  PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&x_vec));
+  PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&mat));
+}
+
+// DISABLED_: same device<->device timing/memory sweep as Section 4's CPU
+// DISABLED_TimingSweep, run only on request. peakRssKB() (host RSS) is
+// supplemented here with cudaMemGetInfo so device memory, not just host
+// memory, is reported - the quantity that actually matters for a GPU
+// comparison.
+TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
+{
+  using std::chrono::duration;
+  using std::chrono::high_resolution_clock;
+
+  const auto cuda_opts = torch::TensorOptions().dtype(torch::kDouble).device(torch::kCUDA);
+
+  for (const int64_t n : {32, 64, 128, 256, 512, 1024, 2048})
+  {
+    PeriodicStencilOperator A(n, shift);
+    ShellContext ctx{&A, n, 4.0 + shift};
+    const auto x_exact = torch::randn({n * n}, cuda_opts);
+    const auto b_tensor = A(x_exact).contiguous();
+
+    cudaDeviceSynchronize();
+    auto t0 = high_resolution_clock::now();
+    const auto [x_torch, torch_it, torch_norm] = solveTorchNative(n, b_tensor);
+    cudaDeviceSynchronize();
+    auto t1 = high_resolution_clock::now();
+    (void)x_torch;
+    (void)torch_norm;
+    const duration<double, std::milli> torch_ms = t1 - t0;
+
+    auto x_tensor = torch::zeros({n * n}, cuda_opts);
+    Mat mat;
+    PetscCallAbort(PETSC_COMM_SELF,
+                   MatCreateShell(PETSC_COMM_SELF, n * n, n * n, n * n, n * n, &ctx, &mat));
+    PetscCallAbort(PETSC_COMM_SELF,
+                   MatShellSetOperation(mat, MATOP_MULT, (void (*)(void))cudaShellMatMult));
+    PetscCallAbort(
+        PETSC_COMM_SELF,
+        MatShellSetOperation(mat, MATOP_GET_DIAGONAL, (void (*)(void))cudaShellGetDiagonal));
+    PetscCallAbort(PETSC_COMM_SELF, MatShellSetVecType(mat, VECSEQCUDA));
+
+    Vec b_vec, x_vec;
+    PetscCallAbort(
+        PETSC_COMM_SELF,
+        VecCreateSeqCUDAWithArray(PETSC_COMM_SELF, 1, n * n, b_tensor.data_ptr<double>(), &b_vec));
+    PetscCallAbort(
+        PETSC_COMM_SELF,
+        VecCreateSeqCUDAWithArray(PETSC_COMM_SELF, 1, n * n, x_tensor.data_ptr<double>(), &x_vec));
+
+    KSP ksp;
+    PetscCallAbort(PETSC_COMM_SELF, KSPCreate(PETSC_COMM_SELF, &ksp));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetOperators(ksp, mat, mat));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetType(ksp, KSPCG));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetNormType(ksp, KSP_NORM_UNPRECONDITIONED));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetTolerances(ksp, rel_tol, 0.0, PETSC_DEFAULT, n * n));
+    PC pc;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetPC(ksp, &pc));
+    PetscCallAbort(PETSC_COMM_SELF, PCSetType(pc, PCJACOBI));
+
+    cudaDeviceSynchronize();
+    auto t2 = high_resolution_clock::now();
+    PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
+    cudaDeviceSynchronize();
+    auto t3 = high_resolution_clock::now();
+    const duration<double, std::milli> petsc_zero_copy_ms = t3 - t2;
+
+    PetscInt petsc_it;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetIterationNumber(ksp, &petsc_it));
+
+    size_t free_bytes, total_bytes;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    const double used_mb = (total_bytes - free_bytes) / (1024.0 * 1024.0);
+
+    Moose::out << "n=" << n << " torch-native: " << torch_ms.count() << "ms, " << torch_it
+               << " iters | PETSc CUDA (zero-copy Vec): " << petsc_zero_copy_ms.count() << "ms, "
+               << petsc_it << " iters | device mem used so far: " << used_mb << " MB"
+               << " | host peak RSS so far: " << peakRssKB() << " KB\n";
+
+    PetscCallAbort(PETSC_COMM_SELF, KSPDestroy(&ksp));
+    PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&b_vec));
+    PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&x_vec));
+    PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&mat));
+  }
+}
+
+#endif // MARLIN_PETSC_TORCH_CUDA_LEG
