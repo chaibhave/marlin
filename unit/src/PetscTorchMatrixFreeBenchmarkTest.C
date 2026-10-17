@@ -83,9 +83,11 @@ constexpr double c1_3 = 1.0;
 class PeriodicStencilOperator
 {
 public:
-  PeriodicStencilOperator(int64_t n, double shift) : _n(n), _shift(shift)
+  PeriodicStencilOperator(int64_t n, double shift, torch::Device device = torch::kCPU)
+    : _n(n), _shift(shift)
   {
-    _kernel = torch::zeros({1, 1, 3, 3}, torch::kDouble);
+    _kernel =
+        torch::zeros({1, 1, 3, 3}, torch::TensorOptions().dtype(torch::kDouble).device(device));
     _kernel[0][0][1][1] = -2.0 * c0_3;
     _kernel[0][0][0][1] = -c1_3;
     _kernel[0][0][2][1] = -c1_3;
@@ -141,7 +143,11 @@ constexpr double rel_tol = 1e-10;
 std::tuple<torch::Tensor, unsigned int, double>
 solveTorchNative(int64_t n, const torch::Tensor & b)
 {
-  PeriodicStencilOperator A(n, shift);
+  // The stencil's conv2d kernel must live on the same device as b, or torch
+  // raises a device-mismatch error (CPU weight vs. CUDA input) rather than
+  // silently copying - this matters once this leg is also used as the
+  // comparison baseline for a CUDA b (Sec. 7).
+  PeriodicStencilOperator A(n, shift, b.device());
   JacobiPreconditioner M(4.0 + shift);
   return MooseTensor::conjugateGradientSolve(A, b, torch::Tensor(), rel_tol, 0, M);
 }
@@ -807,16 +813,15 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, CudaLegZeroCopyVecMatchesTorchNativeLeg)
   const int64_t n = 16;
   const auto cuda_opts = torch::TensorOptions().dtype(torch::kDouble).device(torch::kCUDA);
 
-  PeriodicStencilOperator A(n, shift);
+  PeriodicStencilOperator A(n, shift, torch::kCUDA);
   ShellContext ctx{&A, n, 4.0 + shift};
 
-  // A(x_exact) is computed on CPU (PeriodicStencilOperator doesn't care
-  // which device its input tensor lives on, but the manufactured-solution
-  // setup here deliberately stays off the timed/measured path), then moved
-  // to CUDA as the actual b for both legs.
+  // x_exact is manufactured on CPU for a reproducible, device-independent
+  // random draw, then moved to CUDA; A (whose kernel now lives on CUDA, for
+  // the shell's MatMult callback below) is applied to it there to get b.
   const auto x_exact_cpu = torch::randn({n * n}, torch::kDouble);
-  auto b_tensor = A(x_exact_cpu).contiguous().to(cuda_opts);
   const auto x_exact = x_exact_cpu.to(cuda_opts);
+  auto b_tensor = A(x_exact).contiguous();
 
   Mat mat;
   PetscCallAbort(PETSC_COMM_SELF,
@@ -895,7 +900,7 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
 
   for (const int64_t n : {32, 64, 128, 256, 512, 1024, 2048})
   {
-    PeriodicStencilOperator A(n, shift);
+    PeriodicStencilOperator A(n, shift, torch::kCUDA);
     ShellContext ctx{&A, n, 4.0 + shift};
     const auto x_exact = torch::randn({n * n}, cuda_opts);
     const auto b_tensor = A(x_exact).contiguous();
