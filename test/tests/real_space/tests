@@ -57,39 +57,47 @@
       input = dirichlet_laplacian_check.i
       csvdiff = dirichlet_laplacian_check_out.csv
       compute_devices = 'cpu cuda mps xpu'
-      detail = 'and reproduce the discrete Laplacian expected from an initial condition that '
-               'is consistent with the boundary values up to a small required perturbation.'
+      detail = 'and reproduce the discrete Laplacian expected from an initial condition that is consistent with the boundary values up to a small required perturbation.'
     []
     [relaxation]
       type = CSVDiff
       input = dirichlet_linear.i
       csvdiff = dirichlet_linear_out.csv
       compute_devices = 'cpu cuda mps xpu'
-      detail = 'and relax an initial condition that does not satisfy the boundary values '
-               'toward the exact linear steady-state profile they imply.'
+      detail = 'and relax an initial condition that does not satisfy the boundary values toward the exact linear steady-state profile they imply.'
     []
   []
 
   [analytic_verification]
     issues = '#122'
     design = TensorDirichletBC.md
-    requirement = 'The system shall reproduce an analytic diffusion solution from Crank, '
-                  '"The Mathematics of Diffusion" (2nd ed.) '
+    requirement = 'The system shall reproduce an analytic diffusion solution from Crank, "The Mathematics of Diffusion" (2nd ed.) '
     [semi_infinite]
       type = CSVDiff
       input = semi_infinite_diffusion.i
       csvdiff = semi_infinite_diffusion_out.csv
       compute_devices = 'cpu cuda mps xpu'
-      detail = 'for a semi-infinite medium with a constant surface concentration '
-               '(Sec. 3.3(i), eq. 3.13, special case of zero initial concentration).'
+      detail = 'for a semi-infinite medium with a constant surface concentration (Sec. 3.3(i), eq. 3.13, special case of zero initial concentration).'
     []
     [thin_slab]
       type = CSVDiff
       input = thin_slab_diffusion.i
       csvdiff = thin_slab_diffusion_out.csv
       compute_devices = 'cpu cuda mps xpu'
-      detail = 'for an instantaneous planar source confined to a thin slab, diffusing '
-               'into an infinite medium (Sec. 2.5, eq. 2.15).'
+      detail = 'for an instantaneous planar source confined to a thin slab, diffusing into an infinite medium (Sec. 2.5, eq. 2.15).'
+    []
+  []
+
+  [robin_bc]
+    issues = '#122'
+    design = TensorRobinBC.md
+    requirement = 'The system shall be able to apply a general Robin boundary condition in real space and relax an initial condition toward the exact linear steady-state profile it implies, cross-validated against '
+    [steady_state]
+      type = CSVDiff
+      input = robin_steady_state.i
+      csvdiff = robin_steady_state_out.csv
+      compute_devices = 'cpu cuda mps xpu'
+      detail = 'the elliptic Robin benchmark from the OpenGeoSys documentation (opengeosys.org/6.5.7/docs/benchmarks/elliptic/elliptic-robin).'
     []
   []
 []
