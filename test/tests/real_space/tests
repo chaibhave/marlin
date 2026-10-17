@@ -66,6 +66,13 @@
       compute_devices = 'cpu cuda mps xpu'
       detail = 'and relax an initial condition that does not satisfy the boundary values toward the exact linear steady-state profile they imply.'
     []
+    [2d_corners]
+      type = CSVDiff
+      input = dirichlet_2d_corners.i
+      csvdiff = dirichlet_2d_corners_out.csv
+      compute_devices = 'cpu cuda mps xpu'
+      detail = 'on a domain that is non-periodic on both axes, exercising the ghost-fill at all four domain corners.'
+    []
   []
 
   [analytic_verification]
