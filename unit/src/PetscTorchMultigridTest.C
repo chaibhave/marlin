@@ -480,6 +480,493 @@ TEST(PetscTorchMultigridTest, TimedPathMatchesPlainPath)
   EXPECT_GT(timed.vcycle_ms, 0.0);
 }
 
+// PICARD SWEEP: variable-coefficient problem and preconditioner-update policies.
+//
+// Test problem (defined here for the benchmark, not a Marlin operator):
+//   -div(D(u) grad u) + sigma u = f,  D(u) = exp(beta u),  periodic, cell-centered.
+// Discretization: 5-point finite volume, face coefficient = harmonic mean of the two
+// adjacent cell values; coarse levels use the 2x2 arithmetic mean of D and the same
+// face rule (rediscretization). f is manufactured from a smooth u_exact so the
+// Picard iteration u_{k+1} = solve(A(D(u_k))) has the known fixed point u_exact.
+// Each linear solve starts from the previous iterate and uses the same
+// unpreconditioned relative tolerance as the rest of this file.
+//
+// The shell MatMult always reads the CURRENT coefficients, so the operator is exact
+// in every policy; only the PCMG setup (Chebyshev bounds, Jacobi diagonals, coarse
+// LU) can be stale. Policies:
+//   Always    - update the preconditioner before every Picard step
+//   BumpOnly  - only PetscObjectStateIncrease on the level Mats (tests whether that
+//               alone triggers a rebuild on an already-solved KSP)
+//   Never     - set up once, before step 0
+//   Threshold - update when the last solve took more than baseline + extra_its
+//               iterations (baseline = iterations right after the last update)
+// A solve that ends with a negative converged reason is redone once after a forced
+// update and counted.
+namespace
+{
+struct VarLevelContext
+{
+  int64_t n;
+  double h2;
+  torch::Tensor dxp, dyp; // face coefficients between cell i and i+1 along dims 0, 1
+};
+
+torch::Tensor
+varStencil(const torch::Tensor & u, const VarLevelContext & c)
+{
+  // Works on [n, n] or batched [m, n, n] input (grids on the last two dims).
+  const auto fx = c.dxp * (u - torch::roll(u, -1, -2));
+  const auto fy = c.dyp * (u - torch::roll(u, -1, -1));
+  return (fx - torch::roll(fx, 1, -2) + fy - torch::roll(fy, 1, -1)) / c.h2 + sigma * u;
+}
+
+void
+setFaceCoefficients(VarLevelContext & c, const torch::Tensor & D)
+{
+  auto harmonic = [&](int64_t dim)
+  {
+    const auto shifted = torch::roll(D, -1, dim);
+    return 2.0 * D * shifted / (D + shifted);
+  };
+  c.dxp = harmonic(0);
+  c.dyp = harmonic(1);
+}
+
+PetscErrorCode
+varLevelMult(Mat A, Vec x, Vec y)
+{
+  VarLevelContext * ctx;
+  PetscCall(MatShellGetContext(A, &ctx));
+  return applyOnGrids(
+      x, y, ctx->n, ctx->n, [&](const torch::Tensor & u) { return varStencil(u, *ctx); });
+}
+
+template <typename F>
+PetscErrorCode
+writeOnGrid(Vec y, int64_t ny, F f)
+{
+  PetscScalar * y_array;
+  PetscMemType memtype;
+  PetscCall(VecGetArrayWriteAndMemType(y, &y_array, &memtype));
+  auto options = torch::TensorOptions().dtype(torch::kDouble);
+#if MARLIN_PCMG_CUDA_LEG
+  std::unique_ptr<PetscStreamGuard> guard;
+  if (PetscMemTypeDevice(memtype))
+  {
+    options = options.device(torch::kCUDA, c10::cuda::current_device());
+    guard = std::make_unique<PetscStreamGuard>();
+  }
+#endif
+  (void)memtype;
+  torch::from_blob(y_array, {ny, ny}, options).copy_(f());
+  PetscCall(VecRestoreArrayWriteAndMemType(y, &y_array));
+  return PETSC_SUCCESS;
+}
+
+/// Pointwise diagonal of the variable-coefficient operator (what PCJACOBI asks for).
+/// Calls are counted: PCJACOBI asks for the diagonal exactly when PCMG rebuilds a
+/// smoother, so the count shows whether an update really reached the levels.
+int diagonal_calls = 0;
+
+PetscErrorCode
+varLevelDiagonal(Mat A, Vec diag)
+{
+  ++diagonal_calls;
+  VarLevelContext * ctx;
+  PetscCall(MatShellGetContext(A, &ctx));
+  return writeOnGrid(diag,
+                     ctx->n,
+                     [&]
+                     {
+                       return (ctx->dxp + torch::roll(ctx->dxp, 1, 0) + ctx->dyp +
+                               torch::roll(ctx->dyp, 1, 1)) /
+                                  ctx->h2 +
+                              sigma;
+                     });
+}
+
+/// Dense coarsest operator from the current coefficients: row k of the batched
+/// stencil applied to unit vectors is column k of A, and A is symmetric.
+void
+fillCoarseDense(Mat A, const VarLevelContext & c)
+{
+  const int64_t m = c.n * c.n;
+  const auto E = torch::eye(m, c.dxp.options()).view({m, c.n, c.n});
+  const auto dense = varStencil(E, c).reshape({m, m}).cpu().contiguous();
+  PetscScalar * array;
+  PetscCallAbort(PETSC_COMM_SELF, MatDenseGetArray(A, &array));
+  std::copy_n(dense.data_ptr<double>(), m * m, array);
+  PetscCallAbort(PETSC_COMM_SELF, MatDenseRestoreArray(A, &array));
+}
+
+Vec
+wrapTensor(torch::Tensor & t, int64_t n, bool cuda)
+{
+  Vec v;
+#if MARLIN_PCMG_CUDA_LEG
+  if (cuda)
+  {
+    PetscCallAbort(PETSC_COMM_SELF,
+                   VecCreateSeqCUDAWithArray(PETSC_COMM_SELF, 1, n * n, t.data_ptr<double>(), &v));
+    return v;
+  }
+#endif
+  (void)cuda;
+  PetscCallAbort(PETSC_COMM_SELF,
+                 VecCreateSeqWithArray(PETSC_COMM_SELF, 1, n * n, t.data_ptr<double>(), &v));
+  return v;
+}
+
+/// KSPCG + PCMG hierarchy for the variable-coefficient operator; same structure as
+/// solvePetscMG (shell level Mats, bilinear P / R = P^T/4, Chebyshev+Jacobi
+/// smoothers, dense LU at n = 8) with updatable coefficients.
+class PicardMG
+{
+public:
+  PicardMG(int64_t n, bool cuda, torch::Device device) : _device(device)
+  {
+    for (int64_t s = n; s >= coarsest_n; s /= 2)
+      _sizes.insert(_sizes.begin(), s);
+    const PetscInt L = _sizes.size();
+    const auto dopts = torch::TensorOptions().dtype(torch::kDouble).device(device);
+
+    for (const auto s : _sizes)
+    {
+      auto ctx = std::make_unique<VarLevelContext>();
+      ctx->n = s;
+      ctx->h2 = 1.0 / (double(s) * s);
+      ctx->dxp = torch::ones({s, s}, dopts);
+      ctx->dyp = torch::ones({s, s}, dopts);
+      _contexts.push_back(std::move(ctx));
+      _transfer_contexts.push_back(
+          std::make_unique<LevelContext>(LevelContext{s, 1.0 / (double(s) * s)}));
+    }
+
+    _A.resize(L);
+    const int64_t mc = _sizes[0] * _sizes[0];
+    PetscCallAbort(PETSC_COMM_SELF, MatCreateSeqDense(PETSC_COMM_SELF, mc, mc, nullptr, &_A[0]));
+#if MARLIN_PCMG_CUDA_LEG
+    if (cuda)
+      PetscCallAbort(PETSC_COMM_SELF,
+                     MatConvert(_A[0], MATSEQDENSECUDA, MAT_INPLACE_MATRIX, &_A[0]));
+#endif
+    fillCoarseDense(_A[0], *_contexts[0]);
+    for (PetscInt l = 1; l < L; ++l)
+    {
+      _A[l] = makeShell(_sizes[l] * _sizes[l],
+                        _sizes[l] * _sizes[l],
+                        reinterpret_cast<LevelContext *>(_contexts[l].get()),
+                        varLevelMult,
+                        cuda);
+      PetscCallAbort(
+          PETSC_COMM_SELF,
+          MatShellSetOperation(_A[l], MATOP_GET_DIAGONAL, (void (*)(void))varLevelDiagonal));
+    }
+
+    PetscCallAbort(PETSC_COMM_SELF, KSPCreate(PETSC_COMM_SELF, &_ksp));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetOperators(_ksp, _A[L - 1], _A[L - 1]));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetType(_ksp, KSPCG));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetNormType(_ksp, KSP_NORM_UNPRECONDITIONED));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetInitialGuessNonzero(_ksp, PETSC_TRUE));
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetTolerances(_ksp, rel_tol, 0.0, PETSC_DEFAULT, 500));
+
+    PC pc;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetPC(_ksp, &pc));
+    PetscCallAbort(PETSC_COMM_SELF, PCSetType(pc, PCMG));
+    PetscCallAbort(PETSC_COMM_SELF, PCMGSetLevels(pc, L, nullptr));
+    PetscCallAbort(PETSC_COMM_SELF, PCMGSetType(pc, PC_MG_MULTIPLICATIVE));
+    PetscCallAbort(PETSC_COMM_SELF, PCMGSetCycleType(pc, PC_MG_CYCLE_V));
+    for (PetscInt l = 1; l < L; ++l)
+    {
+      const int64_t nf = _sizes[l], nc = _sizes[l - 1];
+      Mat P = makeShell(nf * nf, nc * nc, _transfer_contexts[l].get(), prolongMult, cuda);
+      Mat R = makeShell(nc * nc, nf * nf, _transfer_contexts[l].get(), restrictMult, cuda);
+      PetscCallAbort(PETSC_COMM_SELF, PCMGSetInterpolation(pc, l, P));
+      PetscCallAbort(PETSC_COMM_SELF, PCMGSetRestriction(pc, l, R));
+      _transfers.push_back(P);
+      _transfers.push_back(R);
+    }
+    _smoothers.resize(L);
+    for (PetscInt l = 0; l < L; ++l)
+    {
+      KSP smoother;
+      PetscCallAbort(PETSC_COMM_SELF, PCMGGetSmoother(pc, l, &smoother));
+      PetscCallAbort(PETSC_COMM_SELF, KSPSetOperators(smoother, _A[l], _A[l]));
+      _smoothers[l] = smoother;
+      if (l == 0)
+      {
+        PC coarse_pc;
+        PetscCallAbort(PETSC_COMM_SELF, KSPSetType(smoother, KSPPREONLY));
+        PetscCallAbort(PETSC_COMM_SELF, KSPGetPC(smoother, &coarse_pc));
+        PetscCallAbort(PETSC_COMM_SELF, PCSetType(coarse_pc, PCLU));
+      }
+      else
+      {
+        PC smoother_pc;
+        PetscCallAbort(PETSC_COMM_SELF, KSPSetType(smoother, KSPCHEBYSHEV));
+        PetscCallAbort(PETSC_COMM_SELF, KSPGetPC(smoother, &smoother_pc));
+        PetscCallAbort(PETSC_COMM_SELF, PCSetType(smoother_pc, PCJACOBI));
+        PetscCallAbort(PETSC_COMM_SELF, KSPSetTolerances(smoother, 0, 0, PETSC_DEFAULT, 2));
+        PetscCallAbort(PETSC_COMM_SELF, KSPSetNormType(smoother, KSP_NORM_NONE));
+      }
+    }
+  }
+
+  PicardMG(const PicardMG &) = delete;
+  PicardMG & operator=(const PicardMG &) = delete;
+
+  ~PicardMG()
+  {
+    KSPDestroy(&_ksp);
+    for (auto & m : _A)
+      MatDestroy(&m);
+    for (auto & m : _transfers)
+      MatDestroy(&m);
+  }
+
+  KSP ksp() const { return _ksp; }
+  const VarLevelContext & fine() const { return *_contexts.back(); }
+
+  /// Install D (fine-level cell values) on every level and refresh the dense coarse
+  /// matrix. The shell operators see the new values immediately; the PCMG setup
+  /// does not until update() says so.
+  void setCoefficients(const torch::Tensor & D)
+  {
+    auto level_D = D;
+    for (int64_t l = _sizes.size() - 1; l >= 0; --l)
+    {
+      setFaceCoefficients(*_contexts[l], level_D);
+      if (l > 0)
+      {
+        const int64_t nc = _sizes[l - 1];
+        level_D = level_D.view({nc, 2, nc, 2}).mean({1, 3});
+      }
+    }
+    fillCoarseDense(_A[0], *_contexts[0]);
+  }
+
+  /// Make PCMG rebuild its setup on the next KSPSetUp: bump the shell Mats' state
+  /// (MatAssemblyBegin/End) and, if `reattach`, call KSPSetOperators on every level (which is what puts an
+  /// already-solved KSP back into the NEWMATRIX stage), then set up.
+  void update(bool reattach)
+  {
+    for (size_t l = 1; l < _A.size(); ++l)
+    {
+      // The documented public way to bump a MATSHELL's state (PetscObjectStateIncrease
+      // is a private-header call).
+      PetscCallAbort(PETSC_COMM_SELF, MatAssemblyBegin(_A[l], MAT_FINAL_ASSEMBLY));
+      PetscCallAbort(PETSC_COMM_SELF, MatAssemblyEnd(_A[l], MAT_FINAL_ASSEMBLY));
+    }
+    if (reattach)
+    {
+      for (size_t l = 0; l < _A.size(); ++l)
+        PetscCallAbort(PETSC_COMM_SELF, KSPSetOperators(_smoothers[l], _A[l], _A[l]));
+      PetscCallAbort(PETSC_COMM_SELF, KSPSetOperators(_ksp, _A.back(), _A.back()));
+    }
+    PetscCallAbort(PETSC_COMM_SELF, KSPSetUp(_ksp));
+  }
+
+private:
+  torch::Device _device;
+  std::vector<int64_t> _sizes;
+  std::vector<std::unique_ptr<VarLevelContext>> _contexts;
+  std::vector<std::unique_ptr<LevelContext>> _transfer_contexts;
+  std::vector<Mat> _A, _transfers;
+  std::vector<KSP> _smoothers;
+  KSP _ksp;
+};
+
+enum class UpdatePolicy
+{
+  Always,
+  BumpOnly,
+  Never,
+  Threshold
+};
+
+std::string
+policyName(UpdatePolicy p, int extra_its)
+{
+  switch (p)
+  {
+    case UpdatePolicy::Always:
+      return "always";
+    case UpdatePolicy::BumpOnly:
+      return "bump-only";
+    case UpdatePolicy::Never:
+      return "never";
+    case UpdatePolicy::Threshold:
+      return "threshold+" + std::to_string(extra_its);
+  }
+  return "";
+}
+
+struct PicardStep
+{
+  PetscInt its;
+  int reason;
+  int failed_reason;  // converged reason of the attempt that was retried (0 if none)
+  int diagonal_calls; // MatGetDiagonal callbacks during this step's update and solve
+  double update_ms, solve_ms;
+  bool updated, retried;
+  double change; // ||u_{k+1} - u_k|| / ||u_{k+1}||
+};
+
+struct PicardRun
+{
+  std::vector<PicardStep> steps;
+  double coeff_ms = 0, error = 0;
+  torch::Tensor u;
+};
+
+PicardRun
+runPicard(int64_t n, bool cuda, double beta, int num_steps, UpdatePolicy policy, int extra_its)
+{
+  const auto device = cuda ? torch::Device(torch::kCUDA, 0) : torch::Device(torch::kCPU);
+  const auto dopts = torch::TensorOptions().dtype(torch::kDouble).device(device);
+  const std::string tag = " n=" + std::to_string(n);
+  PicardMG mg(n, cuda, device);
+
+  // u_exact in [0.1, 0.9]; f from the same discretization at D(u_exact).
+  const auto xs = ((torch::arange(n, dopts) + 0.5) / n);
+  const double two_pi = 2.0 * M_PI;
+  const auto u_exact =
+      (0.5 +
+       0.25 * torch::sin(two_pi * xs).unsqueeze(1) * torch::cos(2.0 * two_pi * xs).unsqueeze(0) +
+       0.1 * torch::cos(3.0 * two_pi * xs).unsqueeze(1) +
+       0.05 * torch::sin(two_pi * xs).unsqueeze(0))
+          .contiguous();
+  mg.setCoefficients(torch::exp(beta * u_exact));
+  auto b = varStencil(u_exact, mg.fine()).contiguous();
+
+  auto x = torch::full({n, n}, 0.5, dopts); // Picard start u_0 = 0.5
+  Vec b_vec = wrapTensor(b, n, cuda), x_vec = wrapTensor(x, n, cuda);
+
+  PicardRun run;
+  PetscInt baseline = -1, last_its = 0;
+  for (int step = 0; step < num_steps; ++step)
+  {
+    const auto u_prev = x.clone();
+    run.coeff_ms +=
+        timedMs(cuda, "coefficients" + tag, [&] { mg.setCoefficients(torch::exp(beta * u_prev)); });
+
+    PicardStep rec{};
+    const int diagonal_calls_before = diagonal_calls;
+    const bool want_update = step == 0 || policy == UpdatePolicy::Always ||
+                             (policy == UpdatePolicy::Threshold && last_its > baseline + extra_its);
+    if (want_update)
+    {
+      rec.updated = true;
+      rec.update_ms = timedMs(cuda, "PC update" + tag, [&] { mg.update(true); });
+    }
+    else if (policy == UpdatePolicy::BumpOnly)
+      rec.update_ms = timedMs(cuda, "PC bump" + tag, [&] { mg.update(false); });
+
+    auto solve_once = [&]
+    {
+      rec.solve_ms +=
+          timedMs(cuda,
+                  "KSPSolve" + tag,
+                  [&] { PetscCallAbort(PETSC_COMM_SELF, KSPSolve(mg.ksp(), b_vec, x_vec)); });
+      KSPConvergedReason reason;
+      PetscCallAbort(PETSC_COMM_SELF, KSPGetConvergedReason(mg.ksp(), &reason));
+      PetscCallAbort(PETSC_COMM_SELF, KSPGetIterationNumber(mg.ksp(), &rec.its));
+      rec.reason = reason;
+    };
+    solve_once();
+    if (rec.reason < 0 && !rec.updated)
+    {
+      // Stale or indefinite preconditioner (or no convergence): force an update, redo.
+      rec.retried = true;
+      rec.failed_reason = rec.reason;
+      rec.update_ms += timedMs(cuda, "PC update (retry)" + tag, [&] { mg.update(true); });
+      rec.updated = true;
+      x.copy_(u_prev);
+      // solve_ms keeps the failed attempt: its cost is part of the policy.
+      solve_once();
+    }
+    if (rec.updated)
+      baseline = rec.its;
+    last_its = rec.its;
+    rec.diagonal_calls = diagonal_calls - diagonal_calls_before;
+    rec.change = ((x - u_prev).norm() / x.norm()).item<double>();
+    run.steps.push_back(rec);
+  }
+  run.error = ((x - u_exact).norm() / u_exact.norm()).item<double>();
+  run.u = x.clone();
+
+  PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&b_vec));
+  PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&x_vec));
+  return run;
+}
+
+void
+printPicardRun(int64_t n, double beta, UpdatePolicy policy, int extra_its, const PicardRun & r)
+{
+  double update = 0, solve = 0;
+  int updates = 0, retries = 0, negatives = 0;
+  std::string its, upd, diag, failed;
+  PetscInt max_its = 0;
+  for (const auto & s : r.steps)
+  {
+    update += s.update_ms;
+    solve += s.solve_ms;
+    updates += s.updated;
+    retries += s.retried;
+    negatives += s.reason < 0;
+    max_its = std::max(max_its, s.its);
+    its += std::to_string(s.its) + " ";
+    diag += std::to_string(s.diagonal_calls) + " ";
+    if (s.retried)
+      failed += "step" + std::to_string(&s - r.steps.data()) + ":reason" +
+                std::to_string(s.failed_reason) + " ";
+    upd += s.retried ? "R" : (s.updated ? "U" : ".");
+  }
+  printf("n=%ld beta=%.1f policy=%-12s total %.1f ms (update %.1f + solve %.1f), %d updates, %d "
+         "retries, %d failed-final | its: %s| upd: %s | diag calls: %s| retried: %s| max its %d | "
+         "last Picard change %.2e, "
+         "error vs u_exact %.2e\n",
+         long(n),
+         beta,
+         policyName(policy, extra_its).c_str(),
+         update + solve,
+         update,
+         solve,
+         updates,
+         retries,
+         negatives,
+         its.c_str(),
+         upd.c_str(),
+         diag.c_str(),
+         failed.empty() ? "none " : failed.c_str(),
+         int(max_its),
+         r.steps.back().change,
+         r.error);
+}
+} // namespace
+
+// CPU check of the Picard machinery: every policy must reach the same iterate (the
+// policy changes only the preconditioner), and the Picard iteration must converge
+// to the manufactured solution.
+TEST(PetscTorchMultigridTest, PicardPoliciesReachTheSameIterate)
+{
+  const int64_t n = 64;
+  const double beta = 3.0;
+  const int steps = 14;
+  const auto reference = runPicard(n, false, beta, steps, UpdatePolicy::Always, 0);
+  printPicardRun(n, beta, UpdatePolicy::Always, 0, reference);
+  EXPECT_LT(reference.steps.back().change, 1e-6);
+  for (const auto [policy, extra] : {std::pair{UpdatePolicy::BumpOnly, 0},
+                                     std::pair{UpdatePolicy::Never, 0},
+                                     std::pair{UpdatePolicy::Threshold, 2}})
+  {
+    const auto run = runPicard(n, false, beta, steps, policy, extra);
+    printPicardRun(n, beta, policy, extra, run);
+    EXPECT_LT((run.u - reference.u).norm().item<double>() / reference.u.norm().item<double>(),
+              1e-8);
+  }
+}
+
 #if MARLIN_PCMG_CUDA_LEG
 // Timing only; correctness is asserted through the relative error. n = 256..8192
 // matches the torch V-cycle sweep. Per size: KSPSetUp, first and repeat solve,
@@ -502,5 +989,21 @@ TEST(PetscTorchMultigridTest, DISABLED_CudaTimingSweep)
            r.vcycle_ms,
            r.relative_error);
   }
+}
+#endif
+
+#if MARLIN_PCMG_CUDA_LEG
+// Timing only. beta = 3 and 9 give a D contrast of about 11x and 1300x over u_exact.
+TEST(PetscTorchMultigridTest, DISABLED_CudaPicardSweep)
+{
+  ASSERT_TRUE(torch::cuda::is_available()) << "needs a CUDA-enabled libtorch and a GPU";
+  constexpr int steps = 10;
+  for (const int64_t n : {1024, 4096})
+    for (const double beta : {3.0, 9.0})
+      for (const auto [policy, extra] : {std::pair{UpdatePolicy::Always, 0},
+                                         std::pair{UpdatePolicy::BumpOnly, 0},
+                                         std::pair{UpdatePolicy::Never, 0},
+                                         std::pair{UpdatePolicy::Threshold, 2}})
+        printPicardRun(n, beta, policy, extra, runPicard(n, true, beta, steps, policy, extra));
 }
 #endif
