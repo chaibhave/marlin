@@ -616,8 +616,10 @@ timeSmootherInCallback(int64_t n, bool cuda, Mode mode, int reps, const torch::T
   TorchSmoother smoother(ctx.st, n, options, mode);
   ctx.smoother = &smoother;
 
+  // Draw the input on the CPU generator (the CUDA one gives a different sequence), as the
+  // reference does, then copy it to the device.
   torch::manual_seed(0);
-  auto r = torch::randn({n, n}, options);
+  auto r = torch::randn({n, n}, torch::kDouble).to(options.device());
   auto z = torch::zeros_like(r);
   Vec r_vec, z_vec;
   if (cuda)
@@ -691,7 +693,7 @@ eagerSmootherResult(int64_t n)
   const auto options = torch::TensorOptions().dtype(torch::kDouble);
   TorchSmoother smoother(st, n, options, Mode::Eager);
   torch::manual_seed(0);
-  return smoother.apply(torch::randn({n, n}, options));
+  return smoother.apply(torch::randn({n, n}, torch::kDouble));
 }
 
 int
