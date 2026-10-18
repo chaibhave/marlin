@@ -123,6 +123,48 @@ This section is a reference for what we are building toward across the PR
 sequence in Section~\ref{sec:roadmap} --- no single PR implements all of it
 at once.
 
+\subsection{Hybrid Design: PETSc Owns the Algorithms, Torch Owns the Kernels}
+\label{sec:hybrid}
+
+\begin{tcolorbox}[colback=lightgray, colframe=marlinblue, boxrule=0.6pt, arc=1mm]
+\textbf{Decided 2026-10-18} after the PR1a/PR1b evidence chain
+(Section~\ref{sec:pr1b}). The deciding factor was generality and long-term
+maintenance (PETSc's solver stack is maintained by full-time scientists),
+not speed: the measured gap was not large in either direction.
+\end{tcolorbox}
+
+\begin{longtable}{p{0.36\textwidth} p{0.1\textwidth} p{0.44\textwidth}}
+\toprule
+Layer & Owner & Mechanism \\
+\midrule
+\endhead
+Krylov method, convergence tests & PETSc & \texttt{KSPCG} (SPD), \texttt{KSPGMRES}/\texttt{KSPFGMRES} otherwise \\
+Multigrid cycle and coarse solve & PETSc & \texttt{PCMG}; coarse level is a small assembled \texttt{Mat} \\
+Default smoother & PETSc & \texttt{KSPCHEBYSHEV} + \texttt{PCJACOBI} per level \\
+Later: SNES, TS, AMG & PETSc & AMG on an assembled \texttt{Pmat} (PR4a) \\
+Level operator action and diagonal & torch & \texttt{MATSHELL} \texttt{MatMult}/\texttt{GetDiagonal} running the \texttt{LinearFDOperator} stencil \\
+Restriction / prolongation & torch & \texttt{MATSHELL}s via \texttt{PCMGSetRestriction}/\texttt{PCMGSetInterpolation} \\
+Optional custom smoother & torch & \texttt{PCSHELL} per level (e.g.\ symmetric red-black Gauss-Seidel for non-SPD), optionally fused via \texttt{TracedComputeSequence} \\
+\bottomrule
+\end{longtable}
+
+Configuration rules from the evidence:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Mark SPD operators.} Set \texttt{MAT\_SPD} on every level
+whose operator is SPD. This halved PCMG setup on the H200 (724$\to$408~ms
+at $n=8192$, 69$\to$9~ms at $n=256$) with the same iterations and solution.
+\item \textbf{Leave a hook for analytic Chebyshev bounds.} Gershgorin bounds
+from the stencil coefficients would be passed through
+\texttt{KSPChebyshevSetEigenvalues} and would remove the remaining per-level
+eigenvalue estimate. Not built in v1.
+\item \textbf{Reuse the preconditioner across Picard iterations}
+(Section~\ref{sec:decisions}, item~3).
+\end{itemize}
+
+The torch-native solvers remain. \texttt{conjugateGradientSolve} is the MPS
+path, and the PR1b torch multigrid spike is the reference for a fused,
+torch-only cycle.
+
 \subsection{Operator Application: Matrix-Free (Partial Assembly)}
 \label{sec:partial-assembly}
 
@@ -431,13 +473,29 @@ DOF-indexing is kept as its own component rather than hardwired
 one-field-per-Mat, so a future monolithic solver is additive, not a rewrite.
 \item \textbf{Mutually exclusive solve mode} --- a simulation picks PETSc-FD
 mode or an existing explicit/spectral mode, not a mix in one run.
-\item \textbf{Matrix reassembly every Picard iteration}, by default (not
-every substep, not only once per timestep). A \texttt{coefficientsChanged()}
-hook exists for future caching but is not relied upon in v1.
+\item \textbf{Preconditioner reuse across Picard iterations, with an
+iteration threshold and a mandatory rebuild-and-retry} (revised 2026-10-18;
+replaces ``reassembly every Picard iteration'').
+\begin{itemize}
+\item \textbf{What is reused.} The shell operators always carry the current
+coefficients, so the Krylov method solves the current system. Only the PCMG
+setup is reused: the Jacobi diagonals, the Chebyshev estimates and the
+coarse factorisation.
+\item \textbf{When it is rebuilt.} When the iteration count exceeds a
+threshold, and always, with a retry, on a negative converged reason. A stale
+Chebyshev setup went indefinite (\texttt{KSP\_DIVERGED\_INDEFINITE\_PC}) in
+PR1b.
+\item \textbf{How a rebuild is triggered.} Bumping a shell Mat's state makes
+\texttt{PCApply} lazily rerun \texttt{PCSetUp} inside the next solve.
+\end{itemize}
+Measured at $\beta=3$, $n=4096$: 1695~ms with reuse vs.\ 2786~ms rebuilding
+every step. Reuse saves little at $\sim$1300$\times$ coefficient contrast.
 \item \textbf{Dirichlet, Neumann, and Robin all in v1} --- Robin is the
 general implementation; Dirichlet/Neumann are presets of it.
-\item \textbf{Matrix-free (partial-assembly) operator application by
-default.} PETSc's KSP operates against a \texttt{MatCreateShell} whose
+\item \textbf{Hybrid PETSc + torch} (revised 2026-10-18,
+Section~\ref{sec:hybrid}), with KSPCG + PCMG on torch shell levels as the
+default for SPD fields, and \textbf{matrix-free (partial-assembly) operator
+application by default.} PETSc's KSP operates against a \texttt{MatCreateShell} whose
 \texttt{MatMult} calls the existing matrix-free \texttt{computeBuffer()}-style
 stencil action directly on torch tensors; no sparse matrix is assembled or
 stored for \texttt{Amat}. For cases where matrix-free preconditioning
@@ -483,9 +541,11 @@ R2 & Picard may not converge (or converge slowly) for strongly nonlinear
 coupling (e.g.\ KKS mobility) & Could force a redesign of the coupling
 strategy late & PR6, explicitly measured and tuned on a real coupled case,
 not assumed \\
-R3 & Per-Picard-iteration matrix reassembly may dominate runtime & Could
-make the ``performant'' goal fail in practice & Profiled at PR3 (single
-field) and re-profiled at PR6 (coupled, Picard) \\
+R3 & PCMG setup may dominate Picard runtime, and reuse may degrade the
+preconditioner at high contrast & Could make the ``performant'' goal fail
+in practice & Partly measured in PR1b: setup is 1--1.8$\times$ a solve
+after \texttt{MAT\_SPD}; reuse saved 39\% at $\beta=3$. Re-profiled at PR3
+and PR6 \\
 R4 & Ghost-fill and stencil-row BC math could silently diverge over time as
 code evolves & Would reintroduce exactly the kind of ad hoc inconsistency
 SBM's \texttt{psi} mask already has & A same-BC-instance dual-path test is
@@ -514,6 +574,20 @@ matrix-free \texttt{Amat} + a separately assembled approximate
 \texttt{Pmat} (from \texttt{stencilAt()}) feeding
 \texttt{PCHYPRE}/\texttt{PCGAMG}, preserving zero-copy on \texttt{Amat} and
 the solve vectors (Section~\ref{sec:soa}) \\
+R6 status & \textbf{Retired 2026-10-18} by PR1a + PR1b & Zero-copy works
+on CPU and CUDA; at steady state PETSc is not slower (Jacobi-CG 3--19\%
+faster; PCMG repeat solve 0.70--0.92$\times$ torch MG-PCG) & Setup cost
+traced to our own configuration \\
+R8 & PCMG on torch shell levels may not extend cleanly to multiple ranks:
+level halos via DMDA or our own exchange, coarse gather
+(\texttt{PCREDUNDANT}/\texttt{PCTELESCOPE}), coarsening of thin slabs &
+Multi-rank is required; a late failure reshapes PR3 & PR2b spike \\
+R9 & Non-SPD operators break Chebyshev/Jacobi + CG; torch \texttt{PCSHELL}
+smoothers under GMRES are untested & SPD default does not cover all target
+physics & PR2c spike \\
+R10 & Fusion headroom of torch smoothers inside a PETSc callback is
+unmeasured (eager V-cycle floor $\sim$2~ms in both stacks) & Decides whether
+custom smoothers are worth their maintenance & PR2c, measured \\
 \bottomrule
 \end{longtable}
 
@@ -978,6 +1052,41 @@ Remaining before this PR can be marked \texttt{verified} in the
 status-tracking table: the independent-reviewer-agent pass
 (Section~\ref{sec:gates}) has not yet been run on this diff.}
 
+\pr{1b}{Multigrid Spikes and the Hybrid-Design Decision}
+\label{sec:pr1b}
+These are spikes, not maintained solvers, on branch \texttt{petsc\_torch\_benchmark}.
+Unless stated otherwise every run is 2D, periodic, with the SPD operator
+$-\Delta u + \sigma u$ ($\sigma = 1$). The CUDA runs were done by the user on an
+H200 with PETSc 3.25.4 and libtorch 2.10. The table lists the tests in the
+order they were run.
+
+\begin{longtable}{>{\bfseries}p{0.03\textwidth} p{0.25\textwidth} p{0.4\textwidth} p{0.23\textwidth}}
+\toprule
+\# & Test (commit) & Result & Led to \\
+\midrule
+\endhead
+1 & PR1a Jacobi-CG benchmark, CPU + CUDA (\texttt{12016ae}\ldots\texttt{3ac2c7c}) & Zero-copy holds on both devices. At steady state PETSc is 15--19\% faster on CPU and 3--18\% faster on CUDA. The first CUDA solve is slow & Why? \\
+2 & First-solve source trace (\texttt{27a8807}) & \texttt{PCJACOBI} lazily builds its diagonal and checks it on the host; the \texttt{Vec} wrapping is not the cause & Jacobi-CG is $O(n)$ iterations: is torch GMG feasible? \\
+3 & Torch GMG, emulated slabs (\texttt{c3364ec}) & RBGS V-cycle MG-PCG takes 11 iterations at $n=64..512$, identical bit for bit on 1/2/4 slabs & Real MPI? \\
+4 & Torch GMG, real MPI (\texttt{34e10ff}) & 10 iterations at np $=1/2/4/8$ with the same error. Dropping one halo update breaks it & DMDA instead? \\
+5 & DMDA decomposition spike (\texttt{18d5886}, unmerged) & A DMDA forced onto Marlin's partition matches ownership and ghosts and aliases the data zero-copy on 1--8 ranks & R1 feasible \\
+6 & Torch V-cycle CUDA sweep (\texttt{e566e3c}) & $\sim$2~ms eager launch floor. MG-PCG takes 11 iterations at every $n$ and beats Jacobi-CG by 4.5$\times$ to $>$360$\times$ & Does PETSc GMG match? \\
+7 & PETSc KSPCG+PCMG on torch shells, CPU (\texttt{610802e}) & 9 iterations, grid independent & Time it on the GPU \\
+8 & PCMG CUDA sweep (\texttt{6698261}) & 8--9 iterations. Repeat solve is 0.70--0.92$\times$ torch's, with the same V-cycle floor. \texttt{KSPSetUp} costs 1.5--1.8$\times$ a solve & Paid every Picard step? \\
+9 & Picard update-policy sweep (\texttt{bd00ff4}, \texttt{665ac06}, \texttt{be91418}) & A state bump triggers a lazy rebuild. Stale setups can go indefinite, so retry is mandatory. Threshold reuse saves 39\% at $\beta=3$. At $\beta=9$ every policy fails the DTOL test ($\|b\|$ reference with a warm start) & Stopped tuning the test; audited our PETSc usage \\
+10 & \texttt{-log\_view} audit & Every host$\leftrightarrow$device copy is in \texttt{PCSetUp}: the Jacobi zero-diagonal check and Chebyshev's GMRES estimate. \texttt{PCApply} and \texttt{MatMult} make no copies & Tell PETSc the operator is SPD \\
+11 & \texttt{MAT\_SPD} variant (\texttt{2ded6f0}) & Setup 724$\to$408~ms at $n=8192$ and 69$\to$9~ms at $n=256$; nothing else changes. The Chebyshev estimate remains & Gershgorin bounds deferred; hybrid design adopted \\
+\bottomrule
+\end{longtable}
+
+Logs: \texttt{doc/roadmap/logs/torch\_multigrid\_cuda\_vcycle\_sweep.log},
+\texttt{petsc\_multigrid\_cuda\_sweep.log} and
+\texttt{petsc\_multigrid\_cuda\_sweep\_log\_view.log} (gitignored).
+
+\status{implemented. CPU tests pass and the CUDA sweeps have been run. No
+independent review yet. These are spikes only and are not on the production
+path.}
+
 \pr{2}{DMDA/Decomposition Compatibility Spike}
 \textbf{Scope:} Isolated, throwaway-if-needed investigation + the minimal
 \texttt{DomainAction} addition (\texttt{getGlobalIndexOffset()} or
@@ -999,9 +1108,52 @@ periodic and non-periodic axes.
 
 \textbf{Retires:} R1.
 
-\status{proposed.}
+\status{spike implemented (\texttt{18d5886}, agent worktree, unmerged). It
+passes on 1/2/3/4/6/8 ranks using only public \texttt{DomainAction} getters.
+Non-periodic axes and review are outstanding.}
+
+\pr{2b}{Multi-Rank PCMG on Torch Shell Levels (Spike)}
+\textbf{Scope:} Run PR1b's PCMG problem on real MPI ranks through
+\texttt{DomainAction}. Settle the level halo exchange (per-level DMDA
+vs.\ Marlin's own exchange), the coarse gather
+(\texttt{PCREDUNDANT}/\texttt{PCTELESCOPE}), and how to coarsen thin slabs.
+Add a one-rank 3D check.
+
+\textbf{Verification:} Iteration count and solution must be independent of
+the rank count (np $=1/2/4/8$). Dropping one halo update must break
+convergence.
+
+\textbf{Retires:} R8. \status{proposed.}
+
+\pr{2c}{Non-SPD Operator with a Torch \texttt{PCSHELL} Smoother + Fusion Measurement (Spike)}
+\textbf{Scope:} Advection--diffusion solved with KSPGMRES/FGMRES + PCMG.
+Compare a torch symmetric red-black Gauss-Seidel \texttt{PCSHELL} smoother
+against PETSc's own smoother. Time the same smoother eager, fused through
+\texttt{TracedComputeSequence}, and CUDA-graph captured.
+
+\textbf{Verification:} Iterations and solution against a reference solve;
+timings reported, not assumed.
+
+\textbf{Retires:} R9, R10. \status{proposed.}
 
 \pr{3}{\texttt{PetscFDSolverBase}, Single Field, Matrix-Free, No Picard, No Nonlinear Remainder}
+\textbf{Hybrid-design update (2026-10-18):}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Default solver for an SPD field.} KSPCG + PCMG with torch shell
+level operators (rediscretised on each level), torch shell transfers,
+Chebyshev/Jacobi smoothers and an assembled coarse \texttt{Mat}. All of this
+can be overridden through \texttt{-<field>\_} options.
+\item \textbf{SPD marking.} Levels are marked \texttt{MAT\_SPD} when the
+operator declares itself SPD.
+\item \textbf{Chebyshev bounds.} Leave a hook for analytic Chebyshev bounds.
+\item \textbf{DTOL with warm starts.} PETSc's default divergence test uses
+$\|b\|$ as its reference when the initial guess is nonzero. Whether to
+change it is a separate design decision, not a default change.
+\item \textbf{Extra verification.} \texttt{-log\_view} must show no
+host$\leftrightarrow$device copies in \texttt{KSPSolve}, and the iteration
+count must be independent of grid size.
+\end{itemize}
+
 \textbf{Scope:} \texttt{PetscFDSolverBase : public TensorSolver} --- the
 single solver object, exercised here with exactly one tracked field and one
 \texttt{LinearFDOperator} contribution (constant-D diffusion or Laplacian),
@@ -1072,9 +1224,9 @@ which remains in place for the Krylov iteration itself.
 \texttt{-<field>\_pc\_type hypre}/\texttt{gamg} then builds BoomerAMG/GAMG
 from \texttt{Pmat} while every \texttt{MatMult} still runs against the
 zero-copy, matrix-free \texttt{Amat} (Section~\ref{sec:soa}). \texttt{Pmat}
-is reassembled at the cadence of Section~\ref{sec:decisions} item 3 (every
-Picard iteration by default, or less often if \texttt{coefficientsChanged()}
-indicates the coefficients haven't moved); it may be an
+is reassembled at the preconditioner-update cadence of
+Section~\ref{sec:decisions} item 3 (PCMG on torch shells is now PR3's
+default; PR4a remains the route where geometric coarsening fails); it may be an
 approximate/frozen-coefficient matrix rather than an exact Jacobian, since
 AMG preconditioners only need the right coarsening structure. Selected
 per-field via a solver option. A separate, lower-priority fallback ---
@@ -1153,8 +1305,8 @@ rel/abs tol or Postprocessor-driven convergence, relaxation factor).
 R2 --- do not assume it converges; report iteration counts and residual
 decay for the real coupled case, tune relaxation if needed); cross-validate
 against \texttt{examples/libtorch\_kks/KKS\_libtorch.i}'s qualitative
-behavior; re-profile per-iteration cost now that reassembly happens every
-Picard iteration across two coupled fields (R3, second measurement).
+behavior; re-profile per-iteration cost under the item-3 reuse policy
+across two coupled fields (R3, second measurement).
 
 \textbf{Retires:} R2, R3 (final measurement before declaring the
 performant-goal met or needing follow-up work).
@@ -1192,7 +1344,10 @@ PR & Deliverable & Status & Verification attached? \\
 PR0 & LinearFDOperator mixin + Laplacian retrofit & proposed & --- \\
 PR1 & BC TensorComputes, ghost-fill & proposed & --- \\
 PR1a & Torch-native vs.\ PETSc matrix-free benchmark & implemented, CPU+CUDA verified & CPU+CUDA logs and tables in Section~\ref{sec:roadmap} (PR1a) \\
-PR2 & DMDA/decomposition compatibility spike & proposed & --- \\
+PR1b & Multigrid spikes $\to$ hybrid design & implemented; review not run & chain table and logs (Section~\ref{sec:pr1b}) \\
+PR2 & DMDA/decomposition compatibility spike & spike implemented, unmerged & passes 1--8 ranks \\
+PR2b & Multi-rank PCMG on torch shells & proposed & --- \\
+PR2c & Non-SPD + torch PCSHELL smoother + fusion & proposed & --- \\
 PR3 & PetscFDSolverBase, single field, matrix-free & proposed & --- \\
 PR4 & BC terms in matrix-free operator application & proposed & --- \\
 PR4a & AMG-preconditioned mixed mode (matrix-free Amat + assembled Pmat), contingent & proposed & --- \\
@@ -1216,10 +1371,9 @@ solver objects.
 \item DMDA stencil width when different linear operators need different
 ghost widths --- v1 sizes one DM to the max; revisit only if that proves
 wasteful in PR3/PR5 profiling.
-\item Whether \texttt{coefficientsChanged()} caching is ever worth enabling,
-given decision \#3 in Section~\ref{sec:decisions} already fixes the default
-policy --- revisit only if PR6 profiling shows reassembly cost is the
-dominant bottleneck.
+\item \sout{Whether \texttt{coefficientsChanged()} caching is worth
+enabling} --- superseded by decision \#3's reuse policy. Open: the threshold
+value and whether it is user-facing.
 \item Whether DMDA is still the right choice (PETSc wiring design) once
 matrix-free is the default --- DMDA's main unique value was correct
 assembled-matrix DOF numbering; under matrix-free action, Marlin's existing
@@ -1235,7 +1389,12 @@ wrapping (Section~\ref{sec:soa}) is structurally possible, so the question
 is whether it is faster in practice once wrapped (PR1a decides this with
 real numbers); on MPS, no PETSc \texttt{Vec} type exists at all, so the
 torch-native path is the only option there regardless of what PR1a
-measures on CPU/CUDA.
+measures on CPU/CUDA. \textbf{Resolved 2026-10-18:} PETSc (KSPCG+PCMG on
+torch shells) is the default on CPU and CUDA (Section~\ref{sec:hybrid}).
+\item Which solves PR3--PR6 need first (SPD-only vs.\ non-SPD), and whether
+MPS is a first-class target or torch-CG-only.
+\item Whether non-periodic BCs need special treatment on coarse PCMG levels
+(rediscretised BC rows vs.\ Galerkin) --- check in PR2b/PR4.
 \end{enumerate}
 
 \end{document}
