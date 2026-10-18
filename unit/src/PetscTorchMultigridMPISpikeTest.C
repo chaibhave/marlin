@@ -20,7 +20,10 @@
 //              tensor and fills the ghosts with its own MPI exchange (the
 //              TorchMultigridMPISpikeTest pattern; code duplicated, spike only).
 //   coarsest - an assembled MPIAIJ Mat in PETSc's rank-blocked numbering, solved by
-//              PCREDUNDANT (gathered and LU-factored on every rank).
+//              PCREDUNDANT (gathered and LU-factored on every rank), or by PCTELESCOPE
+//              (gathered to one rank; inner preonly + LU, or one GAMG V-cycle).
+//              Telescope's default mode extracts rows with MatCreateSubMatrices, so it
+//              needs an assembled Mat and cannot wrap the torch shell levels.
 //   levels   - halve while n / 2 >= coarsest_n and every rank's owned extent is even;
 //              otherwise that level becomes the (larger) redundant coarse level.
 // Smoothers: KSPCHEBYSHEV (2 iterations) + PCJACOBI, levels marked MAT_SPD and
@@ -374,6 +377,13 @@ buildLayout(const DomainAction & domain)
   return L;
 }
 
+enum class CoarseSolver
+{
+  Redundant,     // PCREDUNDANT: LU of the full coarse problem on every rank
+  TelescopeLU,   // PCTELESCOPE to one rank, inner preonly + LU (exact, as Redundant)
+  TelescopeGAMG, // PCTELESCOPE to one rank, inner preonly + PCGAMG (one AMG V-cycle)
+};
+
 struct RunResult
 {
   PetscInt its;
@@ -385,7 +395,10 @@ struct RunResult
 };
 
 RunResult
-solvePcmg(const DomainAction & domain, int64_t n, bool drop_fine_halo = false)
+solvePcmg(const DomainAction & domain,
+          int64_t n,
+          CoarseSolver coarse_solver = CoarseSolver::Redundant,
+          bool drop_fine_halo = false)
 {
   const Layout L = buildLayout(domain);
 
@@ -462,9 +475,17 @@ solvePcmg(const DomainAction & domain, int64_t n, bool drop_fine_halo = false)
     PetscCallAbort(L.comm, KSPGetPC(smoother, &smoother_pc));
     if (l == 0)
     {
-      // Gather the coarse problem to every rank and LU-factor it there.
       PetscCallAbort(L.comm, KSPSetType(smoother, KSPPREONLY));
-      PetscCallAbort(L.comm, PCSetType(smoother_pc, PCREDUNDANT));
+      if (coarse_solver == CoarseSolver::Redundant)
+        // Gather the coarse problem to every rank and LU-factor it there.
+        PetscCallAbort(L.comm, PCSetType(smoother_pc, PCREDUNDANT));
+      else
+      {
+        // Gather the coarse problem to one rank; the inner KSP is configured after
+        // KSPSetUp, which is when telescope creates it (on the active rank only).
+        PetscCallAbort(L.comm, PCSetType(smoother_pc, PCTELESCOPE));
+        PetscCallAbort(L.comm, PCTelescopeSetReductionFactor(smoother_pc, L.size));
+      }
     }
     else
     {
@@ -493,6 +514,23 @@ solvePcmg(const DomainAction & domain, int64_t n, bool drop_fine_halo = false)
   // b from the exact operator, independent of the (possibly faulted) shell.
   auto b = applyGhosted(withGhosts(x_exact, L), fine.h2).contiguous();
   auto x = torch::zeros_like(b);
+
+  if (coarse_solver != CoarseSolver::Redundant)
+  {
+    PetscCallAbort(L.comm, KSPSetUp(ksp));
+    KSP coarse, inner;
+    PC coarse_pc, inner_pc;
+    PetscCallAbort(L.comm, PCMGGetCoarseSolve(pc, &coarse));
+    PetscCallAbort(L.comm, KSPGetPC(coarse, &coarse_pc));
+    PetscCallAbort(L.comm, PCTelescopeGetKSP(coarse_pc, &inner));
+    if (inner) // null on the inactive ranks
+    {
+      PetscCallAbort(PETSC_COMM_SELF, KSPGetPC(inner, &inner_pc));
+      PetscCallAbort(
+          PETSC_COMM_SELF,
+          PCSetType(inner_pc, coarse_solver == CoarseSolver::TelescopeLU ? PCLU : PCGAMG));
+    }
+  }
 
   const int64_t local = fine.mx * fine.my, N = n * n;
   Vec b_vec, x_vec;
@@ -572,7 +610,7 @@ TEST(PetscTorchMultigridMPISpikeTest, DroppedHaloBreaksTheSolve)
 {
   const int64_t n = 64;
   auto md = buildDomain(n);
-  const auto r = solvePcmg(*md.domain, n, /*drop_fine_halo=*/true);
+  const auto r = solvePcmg(*md.domain, n, CoarseSolver::Redundant, /*drop_fine_halo=*/true);
   if (worldRank() == 0)
     printf("dropped halo, n=%ld: %d its, reason %d, relative error %.3e\n",
            long(n),
@@ -580,4 +618,40 @@ TEST(PetscTorchMultigridMPISpikeTest, DroppedHaloBreaksTheSolve)
            int(r.reason),
            r.relative_error);
   EXPECT_GT(r.relative_error, 1e-3);
+}
+
+// PCTELESCOPE coarse solve. TelescopeLU solves the same coarse problem exactly, on one
+// rank instead of all, so it must match PCREDUNDANT's iteration count. TelescopeGAMG
+// replaces the exact coarse solve with one AMG V-cycle (a preconditioner choice); its
+// count is printed, and only convergence and the error are checked.
+TEST(PetscTorchMultigridMPISpikeTest, TelescopeCoarseSolve)
+{
+  int size;
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  for (const int64_t n : {64, 256, 96, 112})
+  {
+    auto md = buildDomain(n);
+    const auto redundant = solvePcmg(*md.domain, n, CoarseSolver::Redundant);
+    const auto lu = solvePcmg(*md.domain, n, CoarseSolver::TelescopeLU);
+    const auto gamg = solvePcmg(*md.domain, n, CoarseSolver::TelescopeGAMG);
+    if (worldRank() == 0)
+      printf("np=%d n=%ld levels=%d coarse n=%ld its: redundant %d, telescope+LU %d, "
+             "telescope+GAMG %d (errors %.1e %.1e %.1e)\n",
+             size,
+             long(n),
+             redundant.levels,
+             long(redundant.coarse_n),
+             int(redundant.its),
+             int(lu.its),
+             int(gamg.its),
+             redundant.relative_error,
+             lu.relative_error,
+             gamg.relative_error);
+    EXPECT_EQ(lu.its, redundant.its);
+    for (const auto & r : {lu, gamg})
+    {
+      EXPECT_GT(r.reason, 0);
+      EXPECT_LT(r.relative_error, 1e-8);
+    }
+  }
 }
