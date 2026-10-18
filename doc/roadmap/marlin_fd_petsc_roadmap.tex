@@ -1249,7 +1249,25 @@ against PETSc's own smoother. Time the same smoother eager, fused through
 \textbf{Verification:} Iterations and solution against a reference solve;
 timings reported, not assumed.
 
-\textbf{Retires:} R9, R10. \status{proposed.}
+\textbf{Retires:} R9 (partly), R10 (CPU only so far). \status{CPU spike done
+(\texttt{40f6977}). Periodic $-D\nabla^2u + \mathbf{v}\cdot\nabla u + \sigma u$,
+$\mathbf{v}$ at $30^\circ$, upwind and central advection, fine-grid cell P\'eclet
+0.1/1/10; KSPGMRES + PCMG on the PETSc-owned hierarchy; $n=64/128/256$.
+\begin{itemize}[leftmargin=*]
+\item Chebyshev/Jacobi works at Pe $\le 1$ upwind (10--21 its) and fails at upwind
+Pe $=10$ and central Pe $\ge 1$ (500 its).
+\item Gauss--Seidel smoothers are robust for upwind at every Pe: torch symmetric
+red-black GS (\texttt{PCSHELL}, fine level) 10--29 its, PETSc symmetric
+\texttt{PCSOR} 10--25 its.
+\item Central differencing at Pe $\ge 1$ is solved by no smoother here (Pe $=1$
+breaks down for $n\ge128$; Pe $=10$ gives NaN). Expected cause, not diagnosed:
+the coarse levels see Pe doubled per level and lose the M-matrix property. A
+discretisation/coarse-operator question, not a smoother one.
+\item The traced smoother equals eager to the bit; on CPU it gives no speed-up
+(0.575 vs 0.571~ms per PCApply at $n=256$; 9.4 vs 9.0~ms at $n=1024$).
+\end{itemize}
+Pending: the CUDA eager/traced/CUDA-graph sweep (\texttt{DISABLED\_CudaSmootherFusionSweep},
+H200; never compiled here).}
 
 \pr{3}{\texttt{PetscFDSolverBase}, Single Field, Matrix-Free, No Picard, No Nonlinear Remainder}
 \textbf{Hybrid-design update (2026-10-18):}
@@ -1468,7 +1486,7 @@ PR1a & Torch-native vs.\ PETSc matrix-free benchmark & CPU+CUDA verified, review
 PR1b & Multigrid spikes $\to$ hybrid design & reviewed, findings addressed; not merged (tag \texttt{pr1b-spikes}) & chain table and logs (Section~\ref{sec:pr1b}) \\
 PR2 & DMDA/decomposition compatibility spike & spike implemented, unmerged & passes 1--8 ranks \\
 PR2b & Multi-rank PCMG on torch shells & spike done (\texttt{b3dcd72}) & PETSc-owned hierarchy + cell-centred transfer adopted (user, 2026-10-18) \\
-PR2c & Non-SPD + torch PCSHELL smoother + fusion & proposed & --- \\
+PR2c & Non-SPD + torch PCSHELL smoother + fusion & CPU spike done (\texttt{40f6977}) & GS robust for upwind; Cheby/Jacobi fails at Pe $=10$; central Pe $\ge1$ unsolved; CUDA sweep pending \\
 PR3 & PetscFDSolverBase, single field, matrix-free & proposed & --- \\
 PR4 & BC terms in matrix-free operator application & proposed & --- \\
 PR4a & AMG-preconditioned mixed mode (matrix-free Amat + assembled Pmat), contingent & proposed & --- \\
