@@ -1298,10 +1298,10 @@ $n$ & eager & traced (FuseGraph) & CUDA graph (eager captured) \\
 Tracing gives 2.4--3.2$\times$ at every size (fused kernels, less memory
 traffic); the CUDA graph only removes launch overhead (2.1$\times$ at $n=256$,
 none for $n\ge2048$). This answers R10: fusion is worth having on CUDA.
-The three modes agreed to round-off, but the run's check against the CPU eager
-reference failed (relative difference $\sim$1.3) because the CUDA input was drawn
-from the CUDA random generator; fixed in \texttt{63f0df1} (input drawn on the CPU
-and copied), rerun pending to confirm correctness.}
+All three modes match the CPU eager result to $\le5\times10^{-16}$ relative
+(the first run's check failed only because its input came from the CUDA random
+generator; fixed in \texttt{63f0df1}, rerun at \texttt{31a97ef} passes with
+timings within 2\% of the first run).}
 
 \pr{3}{\texttt{PetscFDSolverBase}, Single Field, Matrix-Free, No Picard, No Nonlinear Remainder}
 \textbf{Hybrid-design update (2026-10-18):}
@@ -1520,7 +1520,7 @@ PR1a & Torch-native vs.\ PETSc matrix-free benchmark & CPU+CUDA verified, review
 PR1b & Multigrid spikes $\to$ hybrid design & reviewed, findings addressed; not merged (tag \texttt{pr1b-spikes}) & chain table and logs (Section~\ref{sec:pr1b}) \\
 PR2 & DMDA/decomposition compatibility spike & spike implemented, unmerged & passes 1--8 ranks \\
 PR2b & Multi-rank PCMG on torch shells & spike done (\texttt{b3dcd72}) & PETSc-owned hierarchy + cell-centred transfer adopted (user, 2026-10-18) \\
-PR2c & Non-SPD + torch PCSHELL smoother + fusion & CPU spike done (\texttt{40f6977}) & GS robust for upwind; Cheby/Jacobi fails at Pe $=10$; central Pe $\ge1$ deferred; CUDA traced 2.4--3.2$\times$ eager (correctness rerun pending) \\
+PR2c & Non-SPD + torch PCSHELL smoother + fusion & CPU spike done (\texttt{40f6977}) & GS robust for upwind; Cheby/Jacobi fails at Pe $=10$; central Pe $\ge1$ deferred; CUDA traced 2.4--3.2$\times$ eager, matches CPU to round-off \\
 PR3 & PetscFDSolverBase, single field, matrix-free & proposed & --- \\
 PR4 & BC terms in matrix-free operator application & proposed & --- \\
 PR4a & AMG-preconditioned mixed mode (matrix-free Amat + assembled Pmat), contingent & proposed & --- \\
