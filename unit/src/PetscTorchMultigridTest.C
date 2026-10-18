@@ -487,7 +487,10 @@ TEST(PetscTorchMultigridTest, TimedPathMatchesPlainPath)
 // Discretization: 5-point finite volume, face coefficient = harmonic mean of the two
 // adjacent cell values; coarse levels use the 2x2 arithmetic mean of D and the same
 // face rule (rediscretization). f is manufactured from a smooth u_exact so the
-// Picard iteration u_{k+1} = solve(A(D(u_k))) has the known fixed point u_exact.
+// under-relaxed Picard iteration
+//   u_{k+1} = (1 - omega) u_k + omega solve(A(D(u_k))),  omega = picard_omega,
+// has the known fixed point u_exact (relaxation does not move the fixed point).
+// Unrelaxed Picard diverged at beta = 9 (step-0 iterate reached D ~ 1e13).
 // Each linear solve starts from the previous iterate and uses the same
 // unpreconditioned relative tolerance as the rest of this file.
 //
@@ -495,8 +498,9 @@ TEST(PetscTorchMultigridTest, TimedPathMatchesPlainPath)
 // in every policy; only the PCMG setup (Chebyshev bounds, Jacobi diagonals, coarse
 // LU) can be stale. Policies:
 //   Always    - update the preconditioner before every Picard step
-//   BumpOnly  - only PetscObjectStateIncrease on the level Mats (tests whether that
-//               alone triggers a rebuild on an already-solved KSP)
+//   BumpOnly  - only bump the level Mats' state; PCApply's PCSetUp then rebuilds
+//               lazily inside the next KSPSolve (observed: diagonal callbacks every
+//               step), so this is a rebuild every step timed inside the solve
 //   Never     - set up once, before step 0
 //   Threshold - update when the last solve took more than baseline + extra_its
 //               iterations (baseline = iterations right after the last update)
@@ -504,6 +508,9 @@ TEST(PetscTorchMultigridTest, TimedPathMatchesPlainPath)
 // update and counted.
 namespace
 {
+/// Picard under-relaxation factor (agreed with the user for this benchmark).
+constexpr double picard_omega = 0.5;
+
 struct VarLevelContext
 {
   int64_t n;
@@ -745,9 +752,9 @@ public:
     fillCoarseDense(_A[0], *_contexts[0]);
   }
 
-  /// Make PCMG rebuild its setup on the next KSPSetUp: bump the shell Mats' state
-  /// (MatAssemblyBegin/End) and, if `reattach`, call KSPSetOperators on every level (which is what puts an
-  /// already-solved KSP back into the NEWMATRIX stage), then set up.
+  /// Make PCMG rebuild its setup: bump the shell Mats' state (MatAssemblyBegin/End)
+  /// and, if `reattach`, also call KSPSetOperators on every level and KSPSetUp, so
+  /// the rebuild happens here rather than lazily inside the next KSPSolve.
   void update(bool reattach)
   {
     for (size_t l = 1; l < _A.size(); ++l)
@@ -885,6 +892,8 @@ runPicard(int64_t n, bool cuda, double beta, int num_steps, UpdatePolicy policy,
       // solve_ms keeps the failed attempt: its cost is part of the policy.
       solve_once();
     }
+    // Under-relaxation: x currently holds the linear-solve result.
+    x.mul_(picard_omega).add_(u_prev, 1.0 - picard_omega);
     if (rec.updated)
       baseline = rec.its;
     last_its = rec.its;
@@ -952,7 +961,7 @@ TEST(PetscTorchMultigridTest, PicardPoliciesReachTheSameIterate)
 {
   const int64_t n = 64;
   const double beta = 3.0;
-  const int steps = 14;
+  const int steps = 30;
   const auto reference = runPicard(n, false, beta, steps, UpdatePolicy::Always, 0);
   printPicardRun(n, beta, UpdatePolicy::Always, 0, reference);
   EXPECT_LT(reference.steps.back().change, 1e-6);
@@ -994,10 +1003,11 @@ TEST(PetscTorchMultigridTest, DISABLED_CudaTimingSweep)
 
 #if MARLIN_PCMG_CUDA_LEG
 // Timing only. beta = 3 and 9 give a D contrast of about 11x and 1300x over u_exact.
+// 30 steps: with omega = 0.5 the Picard contraction is at best 0.5 per step.
 TEST(PetscTorchMultigridTest, DISABLED_CudaPicardSweep)
 {
   ASSERT_TRUE(torch::cuda::is_available()) << "needs a CUDA-enabled libtorch and a GPU";
-  constexpr int steps = 10;
+  constexpr int steps = 30;
   for (const int64_t n : {1024, 4096})
     for (const double beta : {3.0, 9.0})
       for (const auto [policy, extra] : {std::pair{UpdatePolicy::Always, 0},
