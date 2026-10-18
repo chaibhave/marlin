@@ -1156,7 +1156,17 @@ Add a one-rank 3D check.
 the rank count (np $=1/2/4/8$). Dropping one halo update must break
 convergence.
 
-\textbf{Retires:} R8. \status{proposed.}
+\textbf{Retires:} R8. \status{partly implemented (\texttt{46ecff3}). Own MPI halo
+exchange in each shell callback, assembled MPIAIJ coarsest level solved by
+\texttt{PCREDUNDANT}, and halving while every owned extent stays even.
+On CPU at np $=1/2/4/8$: 9 iterations at $n=64/128/256$, and at $n=96$
+(coarse $n=12$), at every rank count, with relative error $\le 2.1\times10^{-13}$.
+Caveat: at $n=112$ on $2\times4$ ranks a slab turns odd, so the hierarchy
+stops early (coarse $n=28$, 7 iterations): the redundant coarse problem
+grows with the rank count, which needs agglomeration or a rule on grid sizes.
+Dropping the fine halo gives relative error 0.61--0.76 while KSP still reports
+convergence, so PR3's tests need an error check, not only a convergence check.
+Outstanding: the DMDA halo variant, \texttt{PCTELESCOPE}, and the 3D check.}
 
 \pr{2c}{Non-SPD Operator with a Torch \texttt{PCSHELL} Smoother + Fusion Measurement (Spike)}
 \textbf{Scope:} Advection--diffusion solved with KSPGMRES/FGMRES + PCMG.
@@ -1381,7 +1391,7 @@ PR1 & BC TensorComputes, ghost-fill & proposed & --- \\
 PR1a & Torch-native vs.\ PETSc matrix-free benchmark & CPU+CUDA verified, reviewed; not merged (tag \texttt{pr1b-spikes}) & CPU+CUDA logs and tables in Section~\ref{sec:roadmap} (PR1a) \\
 PR1b & Multigrid spikes $\to$ hybrid design & reviewed, findings addressed; not merged (tag \texttt{pr1b-spikes}) & chain table and logs (Section~\ref{sec:pr1b}) \\
 PR2 & DMDA/decomposition compatibility spike & spike implemented, unmerged & passes 1--8 ranks \\
-PR2b & Multi-rank PCMG on torch shells & proposed & --- \\
+PR2b & Multi-rank PCMG on torch shells & partly implemented (\texttt{46ecff3}) & own halo + PCREDUNDANT pass np $=1$--8; DMDA, telescope, 3D outstanding \\
 PR2c & Non-SPD + torch PCSHELL smoother + fusion & proposed & --- \\
 PR3 & PetscFDSolverBase, single field, matrix-free & proposed & --- \\
 PR4 & BC terms in matrix-free operator application & proposed & --- \\
