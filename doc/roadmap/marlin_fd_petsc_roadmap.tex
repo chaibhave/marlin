@@ -1302,8 +1302,9 @@ traffic); capturing eager in a CUDA graph only removes launch overhead
 combines both: 1.8$\times$ over traced at $n=256$ (0.033~ms, 5.6$\times$ eager),
 1.3$\times$ at $n=512$, equal at $n=1024$--2048, and 2--3\% slower at $n\ge4096$
 (the copy into the captured input buffer). This answers R10: fusion is worth
-having on CUDA, and graph capture is worth adding on top only for small grids
-(coarse levels, small problems).
+having on CUDA. \textbf{Graph capture is not adopted (user, 2026-10-18):} it
+gives nothing on large systems, and on small ones the run times are already low
+enough that the gain rarely matters.
 All four modes match the CPU eager result to $\le5.2\times10^{-16}$ relative
 (the first run's check failed only because its input came from the CUDA random
 generator; fixed in \texttt{63f0df1}).}
