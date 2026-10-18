@@ -18,6 +18,7 @@
 #include <petscksp.h>
 
 #include <chrono>
+#include <string>
 #include <sys/resource.h>
 
 // Section 7 (CUDA leg) needs both PETSc's CUDA Vec API and libtorch's CUDA
@@ -41,6 +42,11 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <petscdevice_cuda.h>
+#if defined(__has_include)
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#endif
+#endif
 #else
 #define MARLIN_PETSC_TORCH_CUDA_LEG 0
 #endif
@@ -853,6 +859,34 @@ cudaShellGetDiagonal(Mat mat, Vec diag)
   return PETSC_SUCCESS;
 }
 
+/// Scoped NVTX range, so an nsys profile can attribute kernels, memcpys and
+/// idle gaps to a named phase of DISABLED_CudaTimingSweep (nvtx_gpu_proj_sum,
+/// nvtx_kern_sum). Compiles to nothing if the CUDA toolkit's header-only NVTX
+/// (nvtx3) is not on the include path; profile with --trace=cuda,nvtx.
+class NvtxRange
+{
+public:
+  explicit NvtxRange(const char * name)
+  {
+#if defined(__has_include)
+#if __has_include(<nvtx3/nvToolsExt.h>)
+    nvtxRangePushA(name);
+#endif
+#endif
+    (void)name;
+  }
+  ~NvtxRange()
+  {
+#if defined(__has_include)
+#if __has_include(<nvtx3/nvToolsExt.h>)
+    nvtxRangePop();
+#endif
+#endif
+  }
+  NvtxRange(const NvtxRange &) = delete;
+  NvtxRange & operator=(const NvtxRange &) = delete;
+};
+
 /// PeriodicStencilOperator followed by a device-to-device copy of the result
 /// into a fresh tensor. This is the extra per-matvec work cudaShellMatMult
 /// does (it copies torch's conv output into PETSc's y array), so a
@@ -1023,13 +1057,20 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
     const auto x_exact = torch::randn({n * n}, cuda_opts);
     const auto b_tensor = A(x_exact).contiguous();
 
+    // NVTX ranges ("<leg> n=<n>") enclose each timed region so nsys can
+    // separate the legs; see NvtxRange.
     cudaDeviceSynchronize();
     auto t0 = high_resolution_clock::now();
-    const auto [x_torch, torch_it, torch_norm] = solveTorchNative(n, b_tensor);
-    cudaDeviceSynchronize();
+    unsigned int torch_it;
+    {
+      NvtxRange range(("torch-native n=" + std::to_string(n)).c_str());
+      const auto [x_torch, it, torch_norm] = solveTorchNative(n, b_tensor);
+      torch_it = it;
+      cudaDeviceSynchronize();
+      (void)x_torch;
+      (void)torch_norm;
+    }
     auto t1 = high_resolution_clock::now();
-    (void)x_torch;
-    (void)torch_norm;
     const duration<double, std::milli> torch_ms = t1 - t0;
 
     // torch-native leg again, with the same extra device-to-device copy per
@@ -1038,12 +1079,17 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
     JacobiPreconditioner M(4.0 + shift);
     cudaDeviceSynchronize();
     auto t_c0 = high_resolution_clock::now();
-    const auto [x_copy, copy_it, copy_norm] =
-        MooseTensor::conjugateGradientSolve(A_copy, b_tensor, torch::Tensor(), rel_tol, 0, M);
-    cudaDeviceSynchronize();
+    unsigned int copy_it;
+    {
+      NvtxRange range(("torch-native+copy n=" + std::to_string(n)).c_str());
+      const auto [x_copy, it, copy_norm] =
+          MooseTensor::conjugateGradientSolve(A_copy, b_tensor, torch::Tensor(), rel_tol, 0, M);
+      copy_it = it;
+      cudaDeviceSynchronize();
+      (void)x_copy;
+      (void)copy_norm;
+    }
     auto t_c1 = high_resolution_clock::now();
-    (void)x_copy;
-    (void)copy_norm;
     const duration<double, std::milli> torch_copy_ms = t_c1 - t_c0;
 
     auto x_tensor = torch::zeros({n * n}, cuda_opts);
@@ -1079,19 +1125,44 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
     // otherwise PETSc runs it lazily inside the first KSPSolve.
     cudaDeviceSynchronize();
     auto t_s0 = high_resolution_clock::now();
-    PetscCallAbort(PETSC_COMM_SELF, KSPSetUp(ksp));
-    cudaDeviceSynchronize();
+    {
+      NvtxRange range(("PETSc KSPSetUp n=" + std::to_string(n)).c_str());
+      PetscCallAbort(PETSC_COMM_SELF, KSPSetUp(ksp));
+      cudaDeviceSynchronize();
+    }
     auto t_s1 = high_resolution_clock::now();
     const duration<double, std::milli> petsc_setup_ms = t_s1 - t_s0;
 
     auto t2 = high_resolution_clock::now();
-    PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
-    cudaDeviceSynchronize();
+    {
+      NvtxRange range(("PETSc KSPSolve first n=" + std::to_string(n)).c_str());
+      PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
+      cudaDeviceSynchronize();
+    }
     auto t3 = high_resolution_clock::now();
     const duration<double, std::milli> petsc_zero_copy_ms = t3 - t2;
 
     PetscInt petsc_it;
     PetscCallAbort(PETSC_COMM_SELF, KSPGetIterationNumber(ksp, &petsc_it));
+
+    // Second solve from a zero guess on the same KSP: setup and the first
+    // solve's one-off work (see the first-solve profile in the roadmap) are
+    // already paid, so this is the steady-state cost a time-stepping code
+    // would see.
+    x_tensor.zero_();
+    cudaDeviceSynchronize();
+    auto t4 = high_resolution_clock::now();
+    {
+      NvtxRange range(("PETSc KSPSolve repeat n=" + std::to_string(n)).c_str());
+      PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
+      cudaDeviceSynchronize();
+    }
+    auto t5 = high_resolution_clock::now();
+    const duration<double, std::milli> petsc_repeat_ms = t5 - t4;
+
+    PetscInt petsc_repeat_it;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetIterationNumber(ksp, &petsc_repeat_it));
+    EXPECT_EQ(petsc_repeat_it, petsc_it) << "repeat solve iteration count differs from first solve";
 
     size_t free_bytes, total_bytes;
     cudaMemGetInfo(&free_bytes, &total_bytes);
@@ -1101,7 +1172,8 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
                << " iters | torch-native + per-matvec D2D copy: " << torch_copy_ms.count() << "ms, "
                << copy_it << " iters | PETSc CUDA (zero-copy Vec): setup " << petsc_setup_ms.count()
                << "ms, solve " << petsc_zero_copy_ms.count() << "ms, " << petsc_it
-               << " iters | device mem used so far: " << used_mb << " MB"
+               << " iters, repeat solve " << petsc_repeat_ms.count()
+               << "ms | device mem used so far: " << used_mb << " MB"
                << " | host peak RSS so far: " << peakRssKB() << " KB\n";
 
     PetscCallAbort(PETSC_COMM_SELF, KSPDestroy(&ksp));
