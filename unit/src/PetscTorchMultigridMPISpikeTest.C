@@ -17,8 +17,12 @@
 //
 // Choices made in this spike (PR2b in the roadmap):
 //   halo     - every shell callback copies its owned block into a one-cell ghosted
-//              tensor and fills the ghosts with its own MPI exchange (the
-//              TorchMultigridMPISpikeTest pattern; code duplicated, spike only).
+//              tensor and fills the ghosts either with its own MPI exchange (the
+//              TorchMultigridMPISpikeTest pattern; code duplicated, spike only) or with
+//              DMGlobalToLocal on a per-level DMDA forced onto Marlin's partition
+//              (explicit lx / ly, axes swapped so DMDA's x-fastest order is Marlin's
+//              row-major [mx, my], ranks renumbered to match; Vecs placed on the
+//              tensors' storage, no copies besides the ghosted tensor itself).
 //   coarsest - an assembled MPIAIJ Mat in PETSc's rank-blocked numbering, solved by
 //              PCREDUNDANT (gathered and LU-factored on every rank), or by PCTELESCOPE
 //              (gathered to one rank; inner preonly + LU, or one GAMG V-cycle).
@@ -38,6 +42,7 @@
 #include "MooseApp.h"
 #include "gtest/gtest.h"
 
+#include <petscdmda.h>
 #include <petscksp.h>
 
 #include <algorithm>
@@ -202,15 +207,105 @@ applyGhosted(const torch::Tensor & g, double h2)
   return (4.0 * c - nb) / h2 + sigma * c;
 }
 
+/// Per-level DMDA on Marlin's partition plus a global and a local Vec without
+/// storage (placed onto tensors per call). DMDA axis 0 is Marlin axis 1 and vice versa,
+/// so DMDA's x-fastest order is the row-major order of a torch [mx, my] block.
+struct LevelDMDA
+{
+  DM da = nullptr;
+  Vec global = nullptr, local = nullptr;
+  ~LevelDMDA()
+  {
+    VecDestroy(&global);
+    VecDestroy(&local);
+    DMDestroy(&da);
+  }
+};
+
+/// `comm` must number Marlin block (ix, iy) as iy + parts[1] * ix (DMDA's rank order
+/// for the swapped axes); `shift` is the level number.
+std::unique_ptr<LevelDMDA>
+makeLevelDMDA(const Layout & L, MPI_Comm comm, int64_t n, int shift)
+{
+  std::array<std::vector<PetscInt>, 2> counts;
+  for (unsigned int d = 0; d < 2; ++d)
+    for (const auto f : L.fine_counts[d])
+      counts[d].push_back(PetscInt(f >> shift));
+  auto dm = std::make_unique<LevelDMDA>();
+  PetscCallAbort(comm,
+                 DMDACreate2d(comm,
+                              DM_BOUNDARY_PERIODIC,
+                              DM_BOUNDARY_PERIODIC,
+                              DMDA_STENCIL_BOX, // corners: the transfers need them
+                              n,
+                              n,
+                              L.parts[1],
+                              L.parts[0],
+                              1,
+                              1,
+                              counts[1].data(),
+                              counts[0].data(),
+                              &dm->da));
+  PetscCallAbort(comm, DMSetUp(dm->da));
+  // The DMDA must own exactly this rank's Marlin block (DMDA x = Marlin axis 1).
+  PetscInt xs, ys, xm, ym, gxm, gym;
+  PetscCallAbort(comm, DMDAGetCorners(dm->da, &xs, &ys, nullptr, &xm, &ym, nullptr));
+  PetscCallAbort(comm, DMDAGetGhostCorners(dm->da, nullptr, nullptr, nullptr, &gxm, &gym, nullptr));
+  int64_t bx = 0, by = 0;
+  for (unsigned int i = 0; i < L.index[0]; ++i)
+    bx += counts[0][i];
+  for (unsigned int i = 0; i < L.index[1]; ++i)
+    by += counts[1][i];
+  PetscCheckAbort(xs == by && ys == bx && xm == counts[1][L.index[1]] &&
+                      ym == counts[0][L.index[0]] && gxm == xm + 2 && gym == ym + 2,
+                  comm,
+                  PETSC_ERR_PLIB,
+                  "DMDA ownership differs from Marlin's partition");
+  // Vecs without storage: the callers place the tensors' arrays per call.
+  PetscCallAbort(comm, VecCreateMPIWithArray(comm, 1, xm * ym, n * n, nullptr, &dm->global));
+  PetscCallAbort(PETSC_COMM_SELF,
+                 VecCreateSeqWithArray(PETSC_COMM_SELF, 1, gxm * gym, nullptr, &dm->local));
+  return dm;
+}
+
+/// Owned block -> ghosted copy, ghosts filled by DMGlobalToLocal.
+torch::Tensor
+withGhostsDMDA(const torch::Tensor & o, const LevelDMDA & dm)
+{
+  const auto oc = o.contiguous();
+  auto g = torch::zeros({o.size(0) + 2, o.size(1) + 2}, o.options());
+  // DMGlobalToLocal only reads the global Vec.
+  PetscCallAbort(PETSC_COMM_SELF, VecPlaceArray(dm.global, oc.data_ptr<double>()));
+  PetscCallAbort(PETSC_COMM_SELF, VecPlaceArray(dm.local, g.data_ptr<double>()));
+  PetscCallAbort(PETSC_COMM_SELF, DMGlobalToLocalBegin(dm.da, dm.global, INSERT_VALUES, dm.local));
+  PetscCallAbort(PETSC_COMM_SELF, DMGlobalToLocalEnd(dm.da, dm.global, INSERT_VALUES, dm.local));
+  PetscCallAbort(PETSC_COMM_SELF, VecResetArray(dm.local));
+  PetscCallAbort(PETSC_COMM_SELF, VecResetArray(dm.global));
+  return g;
+}
+
 /// One multigrid level as seen by its shell callbacks: global size n, owned extent
-/// [mx, my], h^2, and the rank layout.
+/// [mx, my], h^2, the rank layout, and (DMDA halo only) this level's and the next
+/// coarser level's DMDA.
 struct LevelContext
 {
   int64_t n, mx, my;
   double h2;
   const Layout * L;
   bool skip_halo = false;
+  const LevelDMDA * dmda = nullptr;
+  const LevelDMDA * coarser_dmda = nullptr;
 };
+
+/// Ghosted copy of an owned block of this level (or of the next coarser level).
+torch::Tensor
+ghost(const torch::Tensor & o, const LevelContext & c, bool coarser = false)
+{
+  const LevelDMDA * dm = coarser ? c.coarser_dmda : c.dmda;
+  if (c.skip_halo || !dm)
+    return withGhosts(o, *c.L, c.skip_halo);
+  return withGhostsDMDA(o, *dm);
+}
 
 /// Views x's local array as [in_x, in_y] and y's as [out_x, out_y], sets y = f(x).
 template <typename F>
@@ -238,8 +333,7 @@ levelMult(Mat A, Vec x, Vec y)
                        y,
                        {c->mx, c->my},
                        {c->mx, c->my},
-                       [&](const torch::Tensor & u)
-                       { return applyGhosted(withGhosts(u, *c->L, c->skip_halo), c->h2); });
+                       [&](const torch::Tensor & u) { return applyGhosted(ghost(u, *c), c->h2); });
 }
 
 PetscErrorCode
@@ -262,7 +356,7 @@ prolongMult(Mat P, Vec coarse, Vec fine)
                        {c->mx / 2, c->my / 2},
                        {c->mx, c->my},
                        [&](const torch::Tensor & uc)
-                       { return prolongAxis(prolongAxis(withGhosts(uc, *c->L), 1), 0); });
+                       { return prolongAxis(prolongAxis(ghost(uc, *c, /*coarser=*/true), 1), 0); });
 }
 
 PetscErrorCode
@@ -275,7 +369,7 @@ restrictMult(Mat R, Vec fine, Vec coarse)
                        {c->mx, c->my},
                        {c->mx / 2, c->my / 2},
                        [&](const torch::Tensor & f)
-                       { return restrictAxis(restrictAxis(withGhosts(f, *c->L), 1), 0) / 4.0; });
+                       { return restrictAxis(restrictAxis(ghost(f, *c), 1), 0) / 4.0; });
 }
 
 Mat
@@ -384,6 +478,12 @@ enum class CoarseSolver
   TelescopeGAMG, // PCTELESCOPE to one rank, inner preonly + PCGAMG (one AMG V-cycle)
 };
 
+enum class Halo
+{
+  Own,  // our MPI_Sendrecv exchange
+  Dmda, // DMGlobalToLocal on a per-level DMDA
+};
+
 struct RunResult
 {
   PetscInt its;
@@ -398,6 +498,7 @@ RunResult
 solvePcmg(const DomainAction & domain,
           int64_t n,
           CoarseSolver coarse_solver = CoarseSolver::Redundant,
+          Halo halo = Halo::Own,
           bool drop_fine_halo = false)
 {
   const Layout L = buildLayout(domain);
@@ -420,6 +521,22 @@ solvePcmg(const DomainAction & domain,
   }
   const PetscInt nlev = contexts.size();
   contexts.back()->skip_halo = drop_fine_halo;
+
+  // DMDA halo: one DMDA per shell level (the coarse AIJ level only needs one as the
+  // coarser side of the first transfer), on a communicator in DMDA's rank order.
+  MPI_Comm dmda_comm = MPI_COMM_NULL;
+  std::vector<std::unique_ptr<LevelDMDA>> dmdas;
+  if (halo == Halo::Dmda)
+  {
+    MPI_Comm_split(L.comm, 0, int(L.index[1] + L.parts[1] * L.index[0]), &dmda_comm);
+    for (PetscInt l = 0; l < nlev; ++l)
+      dmdas.push_back(makeLevelDMDA(L, dmda_comm, contexts[l]->n, int(nlev - 1 - l)));
+    for (PetscInt l = 1; l < nlev; ++l)
+    {
+      contexts[l]->dmda = dmdas[l].get();
+      contexts[l]->coarser_dmda = dmdas[l - 1].get();
+    }
+  }
 
   std::vector<Mat> A(nlev);
   A[0] = makeCoarseAIJ(*contexts[0], int(nlev - 1));
@@ -557,6 +674,9 @@ solvePcmg(const DomainAction & domain,
     PetscCallAbort(L.comm, MatDestroy(&m));
   for (auto & m : transfers)
     PetscCallAbort(L.comm, MatDestroy(&m));
+  dmdas.clear();
+  if (dmda_comm != MPI_COMM_NULL)
+    MPI_Comm_free(&dmda_comm);
   return result;
 }
 
@@ -610,7 +730,8 @@ TEST(PetscTorchMultigridMPISpikeTest, DroppedHaloBreaksTheSolve)
 {
   const int64_t n = 64;
   auto md = buildDomain(n);
-  const auto r = solvePcmg(*md.domain, n, CoarseSolver::Redundant, /*drop_fine_halo=*/true);
+  const auto r =
+      solvePcmg(*md.domain, n, CoarseSolver::Redundant, Halo::Own, /*drop_fine_halo=*/true);
   if (worldRank() == 0)
     printf("dropped halo, n=%ld: %d its, reason %d, relative error %.3e\n",
            long(n),
@@ -653,5 +774,34 @@ TEST(PetscTorchMultigridMPISpikeTest, TelescopeCoarseSolve)
       EXPECT_GT(r.reason, 0);
       EXPECT_LT(r.relative_error, 1e-8);
     }
+  }
+}
+
+// DMDA halo: the same solve with every shell's ghosts filled by DMGlobalToLocal on a
+// per-level DMDA instead of our exchange. Same operator and transfers, so the iteration
+// count must match and the solutions must agree to round-off.
+TEST(PetscTorchMultigridMPISpikeTest, DmdaHaloMatchesOwnExchange)
+{
+  int size;
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  for (const int64_t n : {64, 256, 96, 112})
+  {
+    auto md = buildDomain(n);
+    const auto own = solvePcmg(*md.domain, n, CoarseSolver::Redundant, Halo::Own);
+    const auto dmda = solvePcmg(*md.domain, n, CoarseSolver::Redundant, Halo::Dmda);
+    if (worldRank() == 0)
+      printf("np=%d n=%ld its: own halo %d, DMDA halo %d; relative error %.1e %.1e; "
+             "sumsq diff %.1e\n",
+             size,
+             long(n),
+             int(own.its),
+             int(dmda.its),
+             own.relative_error,
+             dmda.relative_error,
+             std::abs(own.sumsq - dmda.sumsq));
+    EXPECT_GT(dmda.reason, 0);
+    EXPECT_EQ(dmda.its, own.its);
+    EXPECT_LT(dmda.relative_error, 1e-8);
+    EXPECT_NEAR(dmda.sumsq, own.sumsq, 1e-9 * own.sumsq);
   }
 }
