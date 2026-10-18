@@ -32,10 +32,11 @@
 //                 shell), PETSc PCSOR (lexicographic symmetric sweep) on every level.
 // Torch smoother modes: eager; traced with the passes TracedComputeSequence applies
 // (EliminateDeadCode, ConstantPropagation, EliminateCommonSubexpression, FuseGraph) and
-// run through a GraphExecutor; CUDA-graph captured (CUDA only).
+// run through a GraphExecutor; CUDA-graph captured eager (CUDA only); CUDA-graph
+// captured traced (CUDA only: the fused kernels replayed in one launch).
 //
 // DISABLED_CudaSmootherFusionSweep times one PCApply of the fine-level PCSHELL with
-// CUDA Vecs (callback on PETSc's stream) for the three modes. Run on a GPU machine with
+// CUDA Vecs (callback on PETSc's stream) for the four modes. Run on a GPU machine with
 //   --gtest_also_run_disabled_tests
 //   --gtest_filter='*PetscTorchNonSymmetricMultigridSpikeTest.DISABLED_CudaSmootherFusionSweep'
 // The CUDA path is compiled only when PETSc and libtorch both have CUDA; it has not
@@ -102,6 +103,7 @@ enum class Mode
   Eager,
   Traced,
   CudaGraph,
+  TracedCudaGraph,
 };
 
 const char *
@@ -202,7 +204,7 @@ public:
     const auto i = torch::arange(n, options.dtype(torch::kLong));
     _red = ((i.unsqueeze(0) + i.unsqueeze(1)) % 2) == 0;
 
-    if (mode == Mode::Traced)
+    if (mode == Mode::Traced || mode == Mode::TracedCudaGraph)
     {
       const auto example = torch::randn({n, n}, options);
       auto forward = [this](torch::jit::Stack inputs) -> torch::jit::Stack
@@ -220,27 +222,12 @@ public:
       torch::jit::FuseGraph(graph, /*strict=*/true);
       _traced = std::make_unique<torch::jit::GraphExecutor>(graph, "rbgs");
     }
-    else if (mode == Mode::CudaGraph)
-    {
-#if MARLIN_PCMG_CUDA_LEG
-      // Capture needs a non-default stream; replay runs on whatever stream is current.
-      _in = torch::zeros({n, n}, options);
-      auto side = c10::cuda::getStreamFromPool();
-      {
-        c10::cuda::CUDAStreamGuard guard(side);
-        for (int k = 0; k < 3; ++k)
-          redBlackGaussSeidel(_in, _st, _red);
-        side.synchronize();
-        _graph = std::make_unique<at::cuda::CUDAGraph>();
-        _graph->capture_begin();
-        _out = redBlackGaussSeidel(_in, _st, _red);
-        _graph->capture_end();
-      }
-      torch::cuda::synchronize();
-#else
-      throw std::runtime_error("CUDA-graph mode needs the CUDA build");
-#endif
-    }
+    if (mode == Mode::CudaGraph)
+      capture(n,
+              options,
+              [this](const torch::Tensor & r) { return redBlackGaussSeidel(r, _st, _red); });
+    else if (mode == Mode::TracedCudaGraph)
+      capture(n, options, [this](const torch::Tensor & r) { return runTraced(r); });
   }
 
   torch::Tensor apply(const torch::Tensor & r)
@@ -250,12 +237,9 @@ public:
       case Mode::Eager:
         return redBlackGaussSeidel(r, _st, _red);
       case Mode::Traced:
-      {
-        torch::jit::Stack stack{r};
-        _traced->run(stack);
-        return stack.back().toTensor();
-      }
+        return runTraced(r);
       case Mode::CudaGraph:
+      case Mode::TracedCudaGraph:
 #if MARLIN_PCMG_CUDA_LEG
         _in.copy_(r);
         _graph->replay();
@@ -268,6 +252,42 @@ public:
   }
 
 private:
+  torch::Tensor runTraced(const torch::Tensor & r)
+  {
+    torch::jit::Stack stack{r};
+    _traced->run(stack);
+    return stack.back().toTensor();
+  }
+
+  /// Capture `smooth` on a fixed input buffer into a CUDA graph.
+  template <typename F>
+  void capture(int64_t n, const torch::TensorOptions & options, F smooth)
+  {
+#if MARLIN_PCMG_CUDA_LEG
+    // Capture needs a non-default stream; replay runs on whatever stream is current.
+    // The warm-up also lets the profiling executor specialise and compile its fused
+    // kernels before capture, so the captured work is the optimised path.
+    _in = torch::zeros({n, n}, options);
+    auto side = c10::cuda::getStreamFromPool();
+    {
+      c10::cuda::CUDAStreamGuard guard(side);
+      for (int k = 0; k < 3; ++k)
+        smooth(_in);
+      side.synchronize();
+      _graph = std::make_unique<at::cuda::CUDAGraph>();
+      _graph->capture_begin();
+      _out = smooth(_in);
+      _graph->capture_end();
+    }
+    torch::cuda::synchronize();
+#else
+    (void)n;
+    (void)options;
+    (void)smooth;
+    throw std::runtime_error("CUDA-graph modes need the CUDA build");
+#endif
+  }
+
   Stencil _st;
   Mode _mode;
   torch::Tensor _red;
@@ -783,18 +803,22 @@ TEST(PetscTorchNonSymmetricMultigridSpikeTest, DISABLED_CudaSmootherFusionSweep)
     const auto eager = timeSmootherInCallback(n, true, Mode::Eager, 50, reference);
     const auto traced = timeSmootherInCallback(n, true, Mode::Traced, 50, reference);
     const auto graph = timeSmootherInCallback(n, true, Mode::CudaGraph, 50, reference);
-    printf("CUDA PCApply n=%ld: eager %.3f ms, traced %.3f ms, CUDA graph %.3f ms "
-           "(max rel diff vs CPU eager: %.1e %.1e %.1e)\n",
+    const auto traced_graph = timeSmootherInCallback(n, true, Mode::TracedCudaGraph, 50, reference);
+    printf("CUDA PCApply n=%ld: eager %.3f ms, traced %.3f ms, CUDA graph %.3f ms, "
+           "traced CUDA graph %.3f ms (max rel diff vs CPU eager: %.1e %.1e %.1e %.1e)\n",
            long(n),
            eager.ms,
            traced.ms,
            graph.ms,
+           traced_graph.ms,
            eager.max_rel_diff,
            traced.max_rel_diff,
-           graph.max_rel_diff);
+           graph.max_rel_diff,
+           traced_graph.max_rel_diff);
     EXPECT_LT(eager.max_rel_diff, 1e-12);
     EXPECT_LT(traced.max_rel_diff, 1e-12);
     EXPECT_LT(graph.max_rel_diff, 1e-12);
+    EXPECT_LT(traced_graph.max_rel_diff, 1e-12);
   }
 #else
   GTEST_SKIP() << "built without CUDA in PETSc and libtorch";
