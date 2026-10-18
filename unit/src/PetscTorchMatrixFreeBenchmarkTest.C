@@ -19,6 +19,7 @@
 
 #include <chrono>
 #include <string>
+#include <utility>
 #include <sys/resource.h>
 
 // Section 7 (CUDA leg) needs both PETSc's CUDA Vec API and libtorch's CUDA
@@ -1059,38 +1060,52 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
 
     // NVTX ranges ("<leg> n=<n>") enclose each timed region so nsys can
     // separate the legs; see NvtxRange.
-    cudaDeviceSynchronize();
-    auto t0 = high_resolution_clock::now();
-    unsigned int torch_it;
+    // Each torch leg is run twice back to back. The first run pays one-off
+    // costs (caching-allocator cudaMalloc for the CG work tensors, kernel
+    // loading); the repeat is the like-for-like counterpart of PETSc's repeat
+    // KSPSolve below.
+    auto timed_solve = [&](const std::string & label,
+                           auto && solve) -> std::pair<double, unsigned int>
     {
-      NvtxRange range(("torch-native n=" + std::to_string(n)).c_str());
-      const auto [x_torch, it, torch_norm] = solveTorchNative(n, b_tensor);
-      torch_it = it;
       cudaDeviceSynchronize();
+      const auto start = high_resolution_clock::now();
+      unsigned int its;
+      {
+        NvtxRange range((label + " n=" + std::to_string(n)).c_str());
+        its = solve();
+        cudaDeviceSynchronize();
+      }
+      const duration<double, std::milli> elapsed = high_resolution_clock::now() - start;
+      return {elapsed.count(), its};
+    };
+
+    auto solve_torch = [&]() -> unsigned int
+    {
+      const auto [x_torch, it, torch_norm] = solveTorchNative(n, b_tensor);
       (void)x_torch;
       (void)torch_norm;
-    }
-    auto t1 = high_resolution_clock::now();
-    const duration<double, std::milli> torch_ms = t1 - t0;
+      return it;
+    };
+    const auto [torch_ms, torch_it] = timed_solve("torch-native first", solve_torch);
+    const auto [torch_repeat_ms, torch_repeat_it] = timed_solve("torch-native repeat", solve_torch);
+    EXPECT_EQ(torch_repeat_it, torch_it);
 
     // torch-native leg again, with the same extra device-to-device copy per
     // matvec that cudaShellMatMult performs (see CopyingStencilOperator).
     CopyingStencilOperator A_copy(A);
     JacobiPreconditioner M(4.0 + shift);
-    cudaDeviceSynchronize();
-    auto t_c0 = high_resolution_clock::now();
-    unsigned int copy_it;
+    auto solve_copy = [&]() -> unsigned int
     {
-      NvtxRange range(("torch-native+copy n=" + std::to_string(n)).c_str());
       const auto [x_copy, it, copy_norm] =
           MooseTensor::conjugateGradientSolve(A_copy, b_tensor, torch::Tensor(), rel_tol, 0, M);
-      copy_it = it;
-      cudaDeviceSynchronize();
       (void)x_copy;
       (void)copy_norm;
-    }
-    auto t_c1 = high_resolution_clock::now();
-    const duration<double, std::milli> torch_copy_ms = t_c1 - t_c0;
+      return it;
+    };
+    const auto [torch_copy_ms, copy_it] = timed_solve("torch-native+copy first", solve_copy);
+    const auto [torch_copy_repeat_ms, copy_repeat_it] =
+        timed_solve("torch-native+copy repeat", solve_copy);
+    EXPECT_EQ(copy_repeat_it, copy_it);
 
     auto x_tensor = torch::zeros({n * n}, cuda_opts);
     Mat mat;
@@ -1168,9 +1183,11 @@ TEST(PetscTorchMatrixFreeBenchmarkTest, DISABLED_CudaTimingSweep)
     cudaMemGetInfo(&free_bytes, &total_bytes);
     const double used_mb = (total_bytes - free_bytes) / (1024.0 * 1024.0);
 
-    Moose::out << "n=" << n << " torch-native: " << torch_ms.count() << "ms, " << torch_it
-               << " iters | torch-native + per-matvec D2D copy: " << torch_copy_ms.count() << "ms, "
-               << copy_it << " iters | PETSc CUDA (zero-copy Vec): setup " << petsc_setup_ms.count()
+    Moose::out << "n=" << n << " torch-native: " << torch_ms << "ms, " << torch_it
+               << " iters, repeat " << torch_repeat_ms
+               << "ms | torch-native + per-matvec D2D copy: " << torch_copy_ms << "ms, " << copy_it
+               << " iters, repeat " << torch_copy_repeat_ms
+               << "ms | PETSc CUDA (zero-copy Vec): setup " << petsc_setup_ms.count()
                << "ms, solve " << petsc_zero_copy_ms.count() << "ms, " << petsc_it
                << " iters, repeat solve " << petsc_repeat_ms.count()
                << "ms | device mem used so far: " << used_mb << " MB"
