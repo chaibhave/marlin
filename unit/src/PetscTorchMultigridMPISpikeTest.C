@@ -680,6 +680,299 @@ solvePcmg(const DomainAction & domain,
   return result;
 }
 
+// ---- PETSc-owned hierarchy (PR2b follow-up) ----
+// The fine level is the torch shell (ghosts by DMGlobalToLocal on the Marlin-partition
+// DMDA). The coarse DMDAs, their partitions and (for Q1 / Q0) the transfers come from
+// PETSc: DMCoarsen / DMCreateInterpolation. Coarse levels are rediscretised and
+// assembled with MatSetValuesStencil. PCMG restricts with P^T (no restriction set), so
+// each coarse operator is scaled by 4^k (k = levels below the fine one), the PETSc
+// convention that makes a rediscretised A_c consistent with P^T A P. This scales only
+// preconditioner levels; the fine operator and the solution are unchanged.
+
+enum class Transfer
+{
+  Q1,          // DMDA_Q1: vertex-based bilinear (DMCreateInterpolation)
+  Q0,          // DMDA_Q0: piecewise constant (DMCreateInterpolation)
+  CellCentred, // cell-centred bilinear, the spike's torch stencil, assembled by us
+};
+
+/// Rediscretised periodic 5-point operator on a coarse DMDA, scaled by (n_fine / M)^2.
+PetscErrorCode
+assembleCoarseLevel(DM da, Mat B, int64_t n_fine)
+{
+  PetscInt M, xs, ys, xm, ym;
+  PetscFunctionBeginUser;
+  PetscCall(DMDAGetInfo(da,
+                        nullptr,
+                        &M,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr));
+  PetscCall(DMDAGetCorners(da, &xs, &ys, nullptr, &xm, &ym, nullptr));
+  const double ratio = double(n_fine) / double(M), scale = ratio * ratio;
+  const double inv_h2 = double(M) * double(M);
+  const PetscScalar diag = scale * (4.0 * inv_h2 + sigma), off = -scale * inv_h2;
+  for (PetscInt j = ys; j < ys + ym; ++j)
+    for (PetscInt i = xs; i < xs + xm; ++i)
+    {
+      MatStencil row{}, cols[5]{};
+      row.i = i, row.j = j;
+      const PetscInt di[5] = {0, -1, 1, 0, 0}, dj[5] = {0, 0, 0, -1, 1};
+      for (int q = 0; q < 5; ++q)
+        cols[q].i = i + di[q], cols[q].j = j + dj[q];
+      const PetscScalar vals[5] = {diag, off, off, off, off};
+      PetscCall(MatSetValuesStencil(B, 1, &row, 5, cols, vals, INSERT_VALUES));
+    }
+  PetscCall(MatAssemblyBegin(B, MAT_FINAL_ASSEMBLY));
+  PetscCall(MatAssemblyEnd(B, MAT_FINAL_ASSEMBLY));
+  PetscCall(MatSetOption(B, MAT_SPD, PETSC_TRUE));
+  PetscCall(MatSetOption(B, MAT_SPD_ETERNAL, PETSC_TRUE));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/// KSPSetComputeOperators callback for the PCMG coarse levels.
+PetscErrorCode
+computeCoarseOperator(KSP ksp, Mat, Mat B, void * ctx)
+{
+  DM da;
+  PetscFunctionBeginUser;
+  PetscCall(KSPGetDM(ksp, &da));
+  PetscCall(assembleCoarseLevel(da, B, *static_cast<int64_t *>(ctx)));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/// Cell-centred bilinear interpolation coarse DMDA -> fine DMDA (the stencil of
+/// prolongAxis: 3/4 own coarse cell, 1/4 the coarse neighbour on the fine cell's side).
+/// Columns are global coarse indices from the coarse ownership ranges: DMCoarsen picks
+/// the coarse partition for vertex-based transfers, so a needed coarse cell can lie
+/// outside the one-cell ghost frame (n = 112 on 2x4 ranks).
+Mat
+cellCentredInterpolation(DM coarse, DM fine)
+{
+  const MPI_Comm comm = PetscObjectComm((PetscObject)fine);
+  PetscInt fxs, fys, fxm, fym, M, m, nproc_x, nproc_y;
+  PetscCallAbort(comm, DMDAGetCorners(fine, &fxs, &fys, nullptr, &fxm, &fym, nullptr));
+  PetscCallAbort(comm,
+                 DMDAGetInfo(coarse,
+                             nullptr,
+                             &M,
+                             &m,
+                             nullptr,
+                             &nproc_x,
+                             &nproc_y,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr));
+  const PetscInt *lx, *ly;
+  PetscCallAbort(comm, DMDAGetOwnershipRanges(coarse, &lx, &ly, nullptr));
+  std::vector<PetscInt> bx(nproc_x + 1, 0), by(nproc_y + 1, 0);
+  for (PetscInt p = 0; p < nproc_x; ++p)
+    bx[p + 1] = bx[p] + lx[p];
+  for (PetscInt p = 0; p < nproc_y; ++p)
+    by[p + 1] = by[p] + ly[p];
+  // DMDA global numbering: rank px + nproc_x * py, x fastest within a rank's block.
+  auto global_col = [&](PetscInt ic, PetscInt jc)
+  {
+    ic = (ic + M) % M;
+    jc = (jc + m) % m;
+    const PetscInt px = std::upper_bound(bx.begin(), bx.end(), ic) - bx.begin() - 1;
+    const PetscInt py = std::upper_bound(by.begin(), by.end(), jc) - by.begin() - 1;
+    PetscInt offset = 0;
+    for (PetscInt q = 0; q < px + nproc_x * py; ++q)
+      offset += lx[q % nproc_x] * ly[q / nproc_x];
+    return offset + (jc - by[py]) * lx[px] + (ic - bx[px]);
+  };
+
+  PetscInt cxm, cym;
+  PetscCallAbort(comm, DMDAGetCorners(coarse, nullptr, nullptr, nullptr, &cxm, &cym, nullptr));
+  Mat P;
+  PetscCallAbort(comm,
+                 MatCreateAIJ(comm,
+                              fxm * fym,
+                              cxm * cym,
+                              PETSC_DETERMINE,
+                              PETSC_DETERMINE,
+                              4,
+                              nullptr,
+                              4,
+                              nullptr,
+                              &P));
+  PetscInt row_start;
+  PetscCallAbort(comm, MatGetOwnershipRange(P, &row_start, nullptr));
+  for (PetscInt j = fys; j < fys + fym; ++j)
+    for (PetscInt i = fxs; i < fxs + fxm; ++i)
+    {
+      const PetscInt row = row_start + (j - fys) * fxm + (i - fxs);
+      const PetscInt ic = i / 2, jc = j / 2;
+      const PetscInt in = i % 2 ? ic + 1 : ic - 1, jn = j % 2 ? jc + 1 : jc - 1;
+      const PetscInt cols[4] = {
+          global_col(ic, jc), global_col(in, jc), global_col(ic, jn), global_col(in, jn)};
+      const PetscScalar vals[4] = {0.5625, 0.1875, 0.1875, 0.0625};
+      PetscCallAbort(comm, MatSetValues(P, 1, &row, 4, cols, vals, INSERT_VALUES));
+    }
+  PetscCallAbort(comm, MatAssemblyBegin(P, MAT_FINAL_ASSEMBLY));
+  PetscCallAbort(comm, MatAssemblyEnd(P, MAT_FINAL_ASSEMBLY));
+  return P;
+}
+
+/// KSPCG + PCMG with the hierarchy built by PETSc from the fine (Marlin-partition) DMDA.
+/// `automatic`: KSPSetDM + KSPSetComputeOperators, PCMG coarsens and builds Q1 / Q0
+/// transfers itself; otherwise DMCoarsenHierarchy and PCMGSetInterpolation by hand
+/// (needed for the cell-centred transfer, which PETSc does not provide).
+RunResult
+solvePetscHierarchy(const DomainAction & domain, int64_t n, Transfer transfer, bool automatic)
+{
+  const Layout L = buildLayout(domain);
+  MPI_Comm comm;
+  MPI_Comm_split(L.comm, 0, int(L.index[1] + L.parts[1] * L.index[0]), &comm);
+  auto fine_dm = makeLevelDMDA(L, comm, n, 0);
+  if (transfer != Transfer::CellCentred)
+    PetscCallAbort(
+        comm, DMDASetInterpolationType(fine_dm->da, transfer == Transfer::Q1 ? DMDA_Q1 : DMDA_Q0));
+
+  // Same depth rule on every rank count: halve while n stays even and >= coarsest_n.
+  PetscInt nlev = 1;
+  int64_t coarse_n = n;
+  while (coarse_n % 2 == 0 && coarse_n / 2 >= coarsest_n)
+    coarse_n /= 2, ++nlev;
+
+  const auto & local_size = domain.getLocalGridSize();
+  LevelContext fine{n, local_size[0], local_size[1], 1.0 / (double(n) * n), &L};
+  fine.dmda = fine_dm.get();
+  const int64_t local = fine.mx * fine.my, N = n * n;
+  Mat A_fine;
+  PetscCallAbort(comm, MatCreateShell(comm, local, local, N, N, &fine, &A_fine));
+  PetscCallAbort(comm, MatShellSetOperation(A_fine, MATOP_MULT, (void (*)(void))levelMult));
+  PetscCallAbort(comm,
+                 MatShellSetOperation(A_fine, MATOP_GET_DIAGONAL, (void (*)(void))levelDiagonal));
+  PetscCallAbort(comm, MatSetOption(A_fine, MAT_SPD, PETSC_TRUE));
+  PetscCallAbort(comm, MatSetOption(A_fine, MAT_SPD_ETERNAL, PETSC_TRUE));
+
+  KSP ksp;
+  PC pc;
+  PetscCallAbort(comm, KSPCreate(comm, &ksp));
+  PetscCallAbort(comm, KSPSetType(ksp, KSPCG));
+  PetscCallAbort(comm, KSPSetNormType(ksp, KSP_NORM_UNPRECONDITIONED));
+  PetscCallAbort(comm, KSPSetTolerances(ksp, rel_tol, 0.0, PETSC_DEFAULT, 1000));
+  PetscCallAbort(comm, KSPGetPC(ksp, &pc));
+  PetscCallAbort(comm, PCSetType(pc, PCMG));
+  PetscCallAbort(comm, PCMGSetLevels(pc, nlev, nullptr));
+  PetscCallAbort(comm, PCMGSetType(pc, PC_MG_MULTIPLICATIVE));
+  PetscCallAbort(comm, PCMGSetCycleType(pc, PC_MG_CYCLE_V));
+
+  std::vector<DM> coarse_dms;
+  std::vector<Mat> owned_mats;
+  if (automatic)
+  {
+    // The fine operator is ours (the shell); only the coarse levels use the callback.
+    PetscCallAbort(comm, KSPSetDM(ksp, fine_dm->da));
+    PetscCallAbort(comm, KSPSetDMActive(ksp, KSP_DMACTIVE_OPERATOR, PETSC_FALSE));
+    PetscCallAbort(comm, KSPSetComputeOperators(ksp, computeCoarseOperator, &fine.n));
+    PetscCallAbort(comm, KSPSetOperators(ksp, A_fine, A_fine));
+  }
+  else
+  {
+    PetscCallAbort(comm, KSPSetOperators(ksp, A_fine, A_fine));
+    coarse_dms.resize(nlev - 1); // [0] is one level below the fine one
+    PetscCallAbort(comm, DMCoarsenHierarchy(fine_dm->da, nlev - 1, coarse_dms.data()));
+    for (PetscInt l = 0; l < nlev - 1; ++l)
+    {
+      // PCMG level index: nlev - 2 - l.
+      DM dc = coarse_dms[l], df = l == 0 ? fine_dm->da : coarse_dms[l - 1];
+      Mat B, P;
+      PetscCallAbort(comm, DMCreateMatrix(dc, &B));
+      PetscCallAbort(comm, assembleCoarseLevel(dc, B, n));
+      KSP smoother;
+      PetscCallAbort(comm, PCMGGetSmoother(pc, nlev - 2 - l, &smoother));
+      PetscCallAbort(comm, KSPSetOperators(smoother, B, B));
+      if (transfer == Transfer::CellCentred)
+        P = cellCentredInterpolation(dc, df);
+      else
+        PetscCallAbort(comm, DMCreateInterpolation(dc, df, &P, nullptr));
+      PetscCallAbort(comm, PCMGSetInterpolation(pc, nlev - 1 - l, P));
+      owned_mats.push_back(B);
+      owned_mats.push_back(P);
+    }
+  }
+
+  for (PetscInt l = 0; l < nlev; ++l)
+  {
+    KSP smoother;
+    PC smoother_pc;
+    PetscCallAbort(comm, PCMGGetSmoother(pc, l, &smoother));
+    PetscCallAbort(comm, KSPGetPC(smoother, &smoother_pc));
+    if (l == 0)
+    {
+      PetscCallAbort(comm, KSPSetType(smoother, KSPPREONLY));
+      PetscCallAbort(comm, PCSetType(smoother_pc, PCREDUNDANT));
+    }
+    else
+    {
+      PetscCallAbort(comm, KSPSetType(smoother, KSPCHEBYSHEV));
+      PetscCallAbort(comm, PCSetType(smoother_pc, PCJACOBI));
+      PetscCallAbort(comm, KSPSetTolerances(smoother, 0, 0, PETSC_DEFAULT, 2));
+      PetscCallAbort(comm, KSPSetNormType(smoother, KSP_NORM_NONE));
+    }
+  }
+
+  // Manufactured solution and b = A x_exact, as in solvePcmg.
+  int64_t bx = 0, by = 0;
+  for (unsigned int i = 0; i < L.index[0]; ++i)
+    bx += L.fine_counts[0][i];
+  for (unsigned int i = 0; i < L.index[1]; ++i)
+    by += L.fine_counts[1][i];
+  const auto xs = (torch::arange(fine.mx, torch::kDouble) + bx + 0.5) / n;
+  const auto ys = (torch::arange(fine.my, torch::kDouble) + by + 0.5) / n;
+  const double two_pi = 2.0 * M_PI;
+  const auto x_exact =
+      (torch::sin(two_pi * xs).unsqueeze(1) * torch::cos(2.0 * two_pi * ys).unsqueeze(0) +
+       0.5 * torch::cos(3.0 * two_pi * xs).unsqueeze(1) +
+       0.25 * torch::sin(two_pi * ys).unsqueeze(0))
+          .contiguous();
+  auto b = applyGhosted(withGhosts(x_exact, L), fine.h2).contiguous();
+  auto x = torch::zeros_like(b);
+  Vec b_vec, x_vec;
+  PetscCallAbort(comm, VecCreateMPIWithArray(comm, 1, local, N, b.data_ptr<double>(), &b_vec));
+  PetscCallAbort(comm, VecCreateMPIWithArray(comm, 1, local, N, x.data_ptr<double>(), &x_vec));
+  PetscCallAbort(comm, KSPSolve(ksp, b_vec, x_vec));
+
+  RunResult result{};
+  PetscCallAbort(comm, KSPGetIterationNumber(ksp, &result.its));
+  PetscCallAbort(comm, KSPGetConvergedReason(ksp, &result.reason));
+  auto global = [&](const torch::Tensor & t)
+  { return domain.allreduceSum(t.sum()).item<double>(); };
+  result.relative_error =
+      std::sqrt(global((x - x_exact).pow(2))) / std::sqrt(global(x_exact.pow(2)));
+  result.levels = int(nlev);
+  result.coarse_n = coarse_n;
+  result.sum = global(x);
+  result.sumsq = global(x * x);
+
+  PetscCallAbort(comm, VecDestroy(&b_vec));
+  PetscCallAbort(comm, VecDestroy(&x_vec));
+  PetscCallAbort(comm, KSPDestroy(&ksp));
+  PetscCallAbort(comm, MatDestroy(&A_fine));
+  for (auto & m : owned_mats)
+    PetscCallAbort(comm, MatDestroy(&m));
+  for (auto & d : coarse_dms)
+    PetscCallAbort(comm, DMDestroy(&d));
+  fine_dm.reset();
+  MPI_Comm_free(&comm);
+  return result;
+}
+
 int
 worldRank()
 {
@@ -1084,4 +1377,47 @@ TEST(PetscTorchMultigridMPISpikeTest, Pcmg3dOneRankIsGridIndependent)
   }
   EXPECT_LE(*std::max_element(its.begin(), its.end()) - *std::min_element(its.begin(), its.end()),
             1);
+}
+
+// PETSc-owned hierarchy: coarse DMDAs and partitions from DMCoarsen, so the depth no
+// longer depends on the rank grid. Cell-centred transfers reproduce the single-rank
+// torch-shell hierarchy (same stencil, same depth), so they must give its iteration
+// count at every rank count, n = 112 on 2x4 included. Q1 / Q0 (PETSc's transfers) are
+// printed; only convergence and the error are checked. The automatic path (KSPSetDM +
+// KSPSetComputeOperators) must match the hand-built Q1 hierarchy exactly.
+TEST(PetscTorchMultigridMPISpikeTest, PetscOwnedHierarchy)
+{
+  int size;
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  const std::map<int64_t, PetscInt> single_rank_its = {{64, 9}, {256, 9}, {96, 9}, {112, 9}};
+  for (const int64_t n : {64, 256, 96, 112})
+  {
+    auto md = buildDomain(n);
+    const auto cc = solvePetscHierarchy(*md.domain, n, Transfer::CellCentred, false);
+    const auto q1 = solvePetscHierarchy(*md.domain, n, Transfer::Q1, false);
+    const auto q0 = solvePetscHierarchy(*md.domain, n, Transfer::Q0, false);
+    const auto q1_auto = solvePetscHierarchy(*md.domain, n, Transfer::Q1, true);
+    if (worldRank() == 0)
+      printf("np=%d n=%ld levels=%d coarse n=%ld its: cell-centred %d, Q1 %d, Q0 %d, "
+             "Q1 automatic %d (errors %.1e %.1e %.1e %.1e)\n",
+             size,
+             long(n),
+             cc.levels,
+             long(cc.coarse_n),
+             int(cc.its),
+             int(q1.its),
+             int(q0.its),
+             int(q1_auto.its),
+             cc.relative_error,
+             q1.relative_error,
+             q0.relative_error,
+             q1_auto.relative_error);
+    EXPECT_EQ(cc.its, single_rank_its.at(n));
+    EXPECT_EQ(q1_auto.its, q1.its);
+    for (const auto & r : {cc, q1, q0, q1_auto})
+    {
+      EXPECT_GT(r.reason, 0);
+      EXPECT_LT(r.relative_error, 1e-8);
+    }
+  }
 }
