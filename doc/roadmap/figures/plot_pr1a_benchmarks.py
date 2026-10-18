@@ -3,7 +3,7 @@
 
 Reads doc/roadmap/logs/petsc_torch_benchmark_{cpu,cuda}.log and produces:
   - timing_sweep.pdf: torch-native vs. PETSc zero-copy matrix-free solve
-    wall-clock time vs. problem size n, CPU and CUDA, log-log.
+    wall-clock time vs. problem size n (CPU; CUDA absolute and per-unknown).
   - anisotropic_amg_vs_jacobi.pdf: Jacobi vs. AMG iteration count and
     KSPSolve wall-clock time on the ill-conditioned (anisotropic) case,
     CPU and CUDA.
@@ -22,6 +22,7 @@ LOGS = HERE.parent / "logs"
 
 COLOR_TORCH = "#DE8F05"
 COLOR_PETSC = "#0173B2"
+COLOR_COPY = "#029E73"
 
 matplotlib.rcParams.update(
     {
@@ -46,23 +47,36 @@ matplotlib.rcParams.update(
 )
 
 
-def parse_timing_sweep(log_text, label):
-    """Parse the DISABLED_TimingSweep / DISABLED_CudaTimingSweep block.
+def parse_timing_sweep(log_text, petsc_label):
+    """Parse the DISABLED_TimingSweep block (CPU log).
 
-    label is the literal text following "PETSc" and preceding the colon,
-    e.g. " (zero-copy Vec)" or " CUDA (zero-copy Vec)".
+    petsc_label is the literal text between "PETSc" and the colon, e.g.
+    " (zero-copy Vec)".
     """
     pattern = re.compile(
         r"n=(\d+) torch-native: ([\d.]+)ms, \d+ iters \| PETSc"
-        + re.escape(label)
+        + re.escape(petsc_label)
         + r": ([\d.]+)ms, \d+ iters"
     )
-    ns, torch_ms, petsc_ms = [], [], []
-    for m in pattern.finditer(log_text):
-        ns.append(int(m.group(1)))
-        torch_ms.append(float(m.group(2)))
-        petsc_ms.append(float(m.group(3)))
+    rows = [(int(m[1]), float(m[2]), float(m[3])) for m in pattern.finditer(log_text)]
+    ns, torch_ms, petsc_ms = (list(c) for c in zip(*rows))
     return ns, torch_ms, petsc_ms
+
+
+def parse_cuda_sweep(log_text):
+    """Parse DISABLED_CudaTimingSweep: torch-native, torch-native with a
+    per-matvec device-to-device copy, and PETSc CUDA (setup, solve)."""
+    pattern = re.compile(
+        r"n=(\d+) torch-native: ([\d.]+)ms, \d+ iters \| "
+        r"torch-native \+ per-matvec D2D copy: ([\d.]+)ms, \d+ iters \| "
+        r"PETSc CUDA \(zero-copy Vec\): setup ([\d.]+)ms, solve ([\d.]+)ms"
+    )
+    rows = [
+        (int(m[1]),) + tuple(float(g) for g in m.groups()[1:])
+        for m in pattern.finditer(log_text)
+    ]
+    ns, torch_ms, copy_ms, setup_ms, petsc_ms = (list(c) for c in zip(*rows))
+    return ns, torch_ms, copy_ms, setup_ms, petsc_ms
 
 
 def parse_anisotropic(log_text, test_name):
@@ -70,29 +84,35 @@ def parse_anisotropic(log_text, test_name):
     pattern = re.compile(
         r"\[ RUN      \] PetscTorchMatrixFreeBenchmarkTest\."
         + re.escape(test_name)
-        + r"\nanisotropic.*?: Jacobi (\d+) its, ([\d.]+)ms \| AMG \(PCGAMG\) (\d+) its, "
-        r"([\d.]+)ms solve \+ ([\d.]+)ms Pmat assembly"
+        + r"\nanisotropic.*?: "
+        r"Jacobi (\d+) its, setup ([\d.]+)ms, solve ([\d.]+)ms, repeat solve ([\d.]+)ms \| "
+        r"AMG \(PCGAMG\) (\d+) its, Pmat assembly ([\d.]+)ms, setup ([\d.]+)ms, "
+        r"solve ([\d.]+)ms, repeat solve ([\d.]+)ms"
     )
     m = pattern.search(log_text)
     if not m:
         raise ValueError(f"Could not find {test_name} result in log")
-    jacobi_its, jacobi_ms, amg_its, amg_solve_ms, amg_assembly_ms = m.groups()
+    keys = [
+        "jacobi_its",
+        "jacobi_setup_ms",
+        "jacobi_solve_ms",
+        "jacobi_repeat_ms",
+        "amg_its",
+        "amg_assembly_ms",
+        "amg_setup_ms",
+        "amg_solve_ms",
+        "amg_repeat_ms",
+    ]
     return {
-        "jacobi_its": int(jacobi_its),
-        "jacobi_ms": float(jacobi_ms),
-        "amg_its": int(amg_its),
-        "amg_solve_ms": float(amg_solve_ms),
-        "amg_assembly_ms": float(amg_assembly_ms),
+        k: (int(v) if k.endswith("its") else float(v)) for k, v in zip(keys, m.groups())
     }
 
 
 def plot_timing_sweep(cpu_log, cuda_log):
     n_cpu, torch_cpu, petsc_cpu = parse_timing_sweep(cpu_log, " (zero-copy Vec)")
-    n_cuda, torch_cuda, petsc_cuda = parse_timing_sweep(
-        cuda_log, " CUDA (zero-copy Vec)"
-    )
+    n_cu, torch_cu, copy_cu, _, petsc_cu = parse_cuda_sweep(cuda_log)
 
-    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.8), sharey=False)
+    fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.6))
 
     ax = axes[0]
     ax.loglog(n_cpu, torch_cpu, "o-", color=COLOR_TORCH, label="torch-native")
@@ -103,17 +123,30 @@ def plot_timing_sweep(cpu_log, cuda_log):
     ax.legend(loc="upper left")
     ax.grid(True, which="both", linewidth=0.4, alpha=0.3)
 
-    # CUDA times span under one decade (~4 to ~32 ms), so a linear y-axis from
-    # zero shows the launch-latency floor and the growth honestly; log-x stays
-    # because n doubles between points.
+    # CUDA: absolute time spans five decades (4 ms to 1.8 s), so it is shown
+    # log-log; the right panel divides by unknowns and iterations to expose
+    # the launch-latency floor and the bandwidth-bound plateau.
     ax = axes[1]
-    ax.semilogx(n_cuda, torch_cuda, "o-", color=COLOR_TORCH, label="torch-native")
-    ax.semilogx(n_cuda, petsc_cuda, "s-", color=COLOR_PETSC, label="PETSc (zero-copy)")
-    ax.set_ylim(0, max(petsc_cuda + torch_cuda) * 1.08)
+    ax.loglog(n_cu, torch_cu, "o-", color=COLOR_TORCH, label="torch-native")
+    ax.loglog(n_cu, copy_cu, "^--", color=COLOR_COPY, label="torch-native + D2D copy")
+    ax.loglog(n_cu, petsc_cu, "s-", color=COLOR_PETSC, label="PETSc (zero-copy)")
     ax.set_xlabel(r"$n$ (grid points per side)")
     ax.set_ylabel("CG solve wall-clock time (ms)")
-    ax.set_title("CUDA")
-    ax.legend(loc="upper left")
+    ax.set_title("CUDA (H200)")
+    ax.legend(loc="upper left", fontsize=7)
+    ax.grid(True, which="both", linewidth=0.4, alpha=0.3)
+
+    iters = 32
+    per_elem = lambda ms, ns: [
+        t * 1e-3 / iters / (n * n) * 1e12 for t, n in zip(ms, ns)
+    ]
+    ax = axes[2]
+    ax.loglog(n_cu, per_elem(torch_cu, n_cu), "o-", color=COLOR_TORCH)
+    ax.loglog(n_cu, per_elem(copy_cu, n_cu), "^--", color=COLOR_COPY)
+    ax.loglog(n_cu, per_elem(petsc_cu, n_cu), "s-", color=COLOR_PETSC)
+    ax.set_xlabel(r"$n$ (grid points per side)")
+    ax.set_ylabel("time per unknown per iteration (ps)")
+    ax.set_title("CUDA, normalized")
     ax.grid(True, which="both", linewidth=0.4, alpha=0.3)
 
     fig.tight_layout()
@@ -124,73 +157,93 @@ def plot_timing_sweep(cpu_log, cuda_log):
 def plot_anisotropic(cpu_log, cuda_log):
     cpu = parse_anisotropic(cpu_log, "AnisotropicAMGConvergesFasterThanJacobi")
     cuda = parse_anisotropic(cuda_log, "AnisotropicCudaAMGConvergesFasterThanJacobi")
-
     devices = ["CPU", "CUDA"]
-    jacobi_its = [cpu["jacobi_its"], cuda["jacobi_its"]]
-    amg_its = [cpu["amg_its"], cuda["amg_its"]]
-    jacobi_ms = [cpu["jacobi_ms"], cuda["jacobi_ms"]]
-    amg_total_ms = [
-        cpu["amg_solve_ms"] + cpu["amg_assembly_ms"],
-        cuda["amg_solve_ms"] + cuda["amg_assembly_ms"],
-    ]
-
+    runs = [cpu, cuda]
     x = range(len(devices))
     width = 0.35
 
     fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.8))
 
     ax = axes[0]
+    jac = [r["jacobi_its"] for r in runs]
+    amg = [r["amg_its"] for r in runs]
+    ax.bar([i - width / 2 for i in x], jac, width, color=COLOR_TORCH, label="Jacobi")
     ax.bar(
-        [i - width / 2 for i in x], jacobi_its, width, color=COLOR_TORCH, label="Jacobi"
-    )
-    ax.bar(
-        [i + width / 2 for i in x],
-        amg_its,
-        width,
-        color=COLOR_PETSC,
-        label="AMG (PCGAMG)",
+        [i + width / 2 for i in x], amg, width, color=COLOR_PETSC, label="AMG (PCGAMG)"
     )
     ax.set_xticks(list(x))
     ax.set_xticklabels(devices)
     ax.set_ylabel("CG iterations")
     ax.set_title("Iteration count")
-    ax.set_ylim(0, max(jacobi_its) * 1.3)
+    ax.set_ylim(0, max(jac) * 1.3)
     ax.legend(loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.0))
-    for i, v in zip(x, jacobi_its):
+    for i, v in zip(x, jac):
         ax.text(i - width / 2, v + 3, str(v), ha="center", va="bottom", fontsize=7)
-    for i, v in zip(x, amg_its):
+    for i, v in zip(x, amg):
         ax.text(i + width / 2, v + 3, str(v), ha="center", va="bottom", fontsize=7)
 
+    # Stacked: one-time costs (Pmat assembly, PC setup) below the per-solve
+    # cost, which is the repeat solve with the PC already built.
     ax = axes[1]
+    jac_setup = [r["jacobi_setup_ms"] for r in runs]
+    jac_solve = [r["jacobi_repeat_ms"] for r in runs]
+    amg_asm = [r["amg_assembly_ms"] for r in runs]
+    amg_setup = [r["amg_setup_ms"] for r in runs]
+    amg_solve = [r["amg_repeat_ms"] for r in runs]
+    xj = [i - width / 2 for i in x]
+    xa = [i + width / 2 for i in x]
+    ax.bar(xj, jac_solve, width, color=COLOR_TORCH, label="Jacobi: solve")
     ax.bar(
-        [i - width / 2 for i in x], jacobi_ms, width, color=COLOR_TORCH, label="Jacobi"
-    )
-    ax.bar(
-        [i + width / 2 for i in x],
-        amg_total_ms,
+        xj,
+        jac_setup,
         width,
+        bottom=jac_solve,
+        color=COLOR_TORCH,
+        alpha=0.45,
+        label="Jacobi: PC setup",
+    )
+    ax.bar(xa, amg_solve, width, color=COLOR_PETSC, label="AMG: solve")
+    bottom = amg_solve
+    ax.bar(
+        xa,
+        amg_setup,
+        width,
+        bottom=bottom,
         color=COLOR_PETSC,
-        label="AMG (solve + Pmat assembly)",
+        alpha=0.6,
+        label="AMG: PC setup",
+    )
+    bottom = [a + b for a, b in zip(bottom, amg_setup)]
+    ax.bar(
+        xa,
+        amg_asm,
+        width,
+        bottom=bottom,
+        color=COLOR_PETSC,
+        alpha=0.3,
+        label=r"AMG: $P_{mat}$ assembly",
     )
     ax.set_xticks(list(x))
     ax.set_xticklabels(devices)
-    ax.set_ylabel("KSPSolve wall-clock time (ms)")
-    ax.set_title("Wall-clock time")
-    ax.set_ylim(0, max(amg_total_ms) * 1.3)
-    ax.legend(loc="upper center", ncol=1, bbox_to_anchor=(0.5, 1.0), fontsize=7)
-    for i, v in zip(x, jacobi_ms):
+    ax.set_ylabel("wall-clock time (ms)")
+    ax.set_title("Solve (PC reused) + one-time costs")
+    top = max(s + u + a for s, u, a in zip(amg_solve, amg_setup, amg_asm))
+    ax.set_ylim(0, top * 1.55)
+    ax.legend(loc="upper left", fontsize=6.5, ncol=1)
+    for i, v in zip(x, jac_solve):
         ax.text(
             i - width / 2,
-            v + max(amg_total_ms) * 0.02,
+            v + jac_setup[i] + top * 0.02,
             f"{v:.1f}",
             ha="center",
             va="bottom",
             fontsize=7,
         )
-    for i, v in zip(x, amg_total_ms):
+    for i, v in zip(x, amg_solve):
+        total = v + amg_setup[i] + amg_asm[i]
         ax.text(
             i + width / 2,
-            v + max(amg_total_ms) * 0.02,
+            total + top * 0.02,
             f"{v:.1f}",
             ha="center",
             va="bottom",
