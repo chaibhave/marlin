@@ -148,6 +148,30 @@ Optional custom smoother & torch & \texttt{PCSHELL} per level (e.g.\ symmetric r
 \bottomrule
 \end{longtable}
 
+\textbf{Revised 2026-10-18 after PR2b (user decision): PETSc owns the
+hierarchy.} The fine level's DMDA is built on Marlin's partition;
+\texttt{DMCoarsen} builds the coarse DMDAs and their partitions, so the depth
+does not depend on the rank grid. Coarse levels are rediscretised and
+assembled; torch keeps the fine-level operator and the optional smoothers.
+Transfers are our cell-centred bilinear interpolation, assembled as an AIJ
+\texttt{Mat} from the DMDA numbering. It matches the cell-centred
+discretisation and gave 9 iterations against \texttt{DMDA\_Q1}'s 9--10 in
+PR2b: the best of the transfers tried, not proven optimal. Where the table
+above differs, this supersedes it:
+
+\begin{longtable}{p{0.36\textwidth} p{0.1\textwidth} p{0.44\textwidth}}
+\toprule
+Layer & Owner & Mechanism \\
+\midrule
+\endhead
+Level hierarchy and partitions & PETSc & Fine \texttt{DMDA} on Marlin's partition, \texttt{DMCoarsen} via \texttt{KSPSetDM} \\
+Fine-level operator and diagonal & torch & \texttt{MATSHELL}, ghosts by \texttt{DMGlobalToLocal} \\
+Coarse-level operators & PETSc & Rediscretised, \texttt{MatSetValuesStencil} via \texttt{KSPSetComputeOperators} \\
+Restriction / prolongation & PETSc & Our cell-centred bilinear AIJ via \texttt{PCMGSetInterpolation}; restriction $=P^T$ \\
+Boundary ghost values & Marlin & \texttt{TensorBoundaryCondition} (DMDA leaves ghosted boundary entries untouched) \\
+\bottomrule
+\end{longtable}
+
 Configuration rules from the evidence:
 \begin{itemize}[leftmargin=*]
 \item \textbf{Mark SPD operators.} Set \texttt{MAT\_SPD} on every level
@@ -505,8 +529,9 @@ policy, and the ``bump-only'' policy was a partial rebuild.
 \item \textbf{Dirichlet, Neumann, and Robin all in v1} --- Robin is the
 general implementation; Dirichlet/Neumann are presets of it.
 \item \textbf{Hybrid PETSc + torch} (revised 2026-10-18,
-Section~\ref{sec:hybrid}), with KSPCG + PCMG on torch shell levels as the
-default for SPD fields, and \textbf{matrix-free (partial-assembly) operator
+Section~\ref{sec:hybrid}), with KSPCG + PCMG on a torch fine-level shell as
+the default for SPD fields. PETSc owns the hierarchy (DMDA + \texttt{DMCoarsen}),
+the assembled coarse levels and the cell-centred transfers (revised after PR2b), and \textbf{matrix-free (partial-assembly) operator
 application by default.} PETSc's KSP operates against a \texttt{MatCreateShell} whose
 \texttt{MatMult} calls the existing matrix-free \texttt{computeBuffer()}-style
 stencil action directly on torch tensors; no sparse matrix is assembled or
@@ -593,7 +618,7 @@ traced to our own configuration \\
 R8 & PCMG on torch shell levels may not extend cleanly to multiple ranks:
 level halos via DMDA or our own exchange, coarse gather
 (\texttt{PCREDUNDANT}/\texttt{PCTELESCOPE}), coarsening of thin slabs &
-Multi-rank is required; a late failure reshapes PR3 & PR2b spike \\
+Multi-rank is required; a late failure reshapes PR3 & Retired for 2D periodic by PR2b (PETSc-owned DMDA hierarchy); multi-rank 3D, non-periodic remain \\
 R9 & Non-SPD operators break Chebyshev/Jacobi + CG; torch \texttt{PCSHELL}
 smoothers under GMRES are untested & SPD default does not cover all target
 physics & PR2c spike \\
@@ -1202,9 +1227,9 @@ single-rank torch-shell hierarchy; \texttt{DMDA\_Q1} 9--10; \texttt{DMDA\_Q0}
 PCMG coarsens and builds Q1 itself) gives the same counts as the hand-built Q1
 hierarchy. PETSc's coarse partition is chosen for vertex-based transfers, so our
 cell-centred interpolation is assembled with global column indices (a needed
-coarse cell can lie outside the one-cell ghost frame). Which transfer to use is
-a user decision (Q1: no transfer code, $\le$1 extra iteration here; cell-centred:
-$\sim$60 lines, matches the discretisation).
+coarse cell can lie outside the one-cell ghost frame). \textbf{Decided (user,
+2026-10-18):} adopt this hierarchy (Section~\ref{sec:hybrid}) with the
+cell-centred transfer.
 \item \textbf{3D, one rank.} 7-point operator, the same transfers applied axis
 by axis, assembled SeqAIJ coarse level: 8 iterations at $n=16/32/64$ with both
 \texttt{PCREDUNDANT} and telescope + LU, relative error $\le 8.7\times10^{-12}$.
@@ -1225,10 +1250,14 @@ timings reported, not assumed.
 \pr{3}{\texttt{PetscFDSolverBase}, Single Field, Matrix-Free, No Picard, No Nonlinear Remainder}
 \textbf{Hybrid-design update (2026-10-18):}
 \begin{itemize}[leftmargin=*]
-\item \textbf{Default solver for an SPD field.} KSPCG + PCMG with torch shell
-level operators (rediscretised on each level), torch shell transfers,
-Chebyshev/Jacobi smoothers and an assembled coarse \texttt{Mat}. All of this
-can be overridden through \texttt{-<field>\_} options.
+\item \textbf{Default solver for an SPD field} (revised after PR2b). KSPCG +
+PCMG on a fine DMDA built on Marlin's partition; \texttt{DMCoarsen} builds the
+coarse levels through \texttt{KSPSetDM} + \texttt{KSPSetComputeOperators}. The
+fine level is a torch shell; coarse levels are rediscretised and assembled with
+\texttt{MatSetValuesStencil}. Transfers are our cell-centred bilinear
+interpolation, assembled as AIJ (global column indices); restriction is $P^T$, so
+coarse operators carry a $4^k$ (2D) / $8^k$ (3D) scaling. Chebyshev/Jacobi
+smoothers. All of this can be overridden through \texttt{-<field>\_} options.
 \item \textbf{SPD marking.} Levels are marked \texttt{MAT\_SPD} and \texttt{MAT\_SPD\_ETERNAL} when the
 operator declares itself SPD (without \texttt{\_ETERNAL}, a re-assembly
 clears the flag); preconditioner rebuilds go through \texttt{KSPSetOperators}
@@ -1313,7 +1342,7 @@ which remains in place for the Krylov iteration itself.
 from \texttt{Pmat} while every \texttt{MatMult} still runs against the
 zero-copy, matrix-free \texttt{Amat} (Section~\ref{sec:soa}). \texttt{Pmat}
 is reassembled at the preconditioner-update cadence of
-Section~\ref{sec:decisions} item 3 (PCMG on torch shells is now PR3's
+Section~\ref{sec:decisions} item 3 (PCMG with a torch fine level is now PR3's
 default; PR4a remains the route where geometric coarsening fails); it may be an
 approximate/frozen-coefficient matrix rather than an exact Jacobian, since
 AMG preconditioners only need the right coarsening structure. Selected
@@ -1434,7 +1463,7 @@ PR1 & BC TensorComputes, ghost-fill & proposed & --- \\
 PR1a & Torch-native vs.\ PETSc matrix-free benchmark & CPU+CUDA verified, reviewed; not merged (tag \texttt{pr1b-spikes}) & CPU+CUDA logs and tables in Section~\ref{sec:roadmap} (PR1a) \\
 PR1b & Multigrid spikes $\to$ hybrid design & reviewed, findings addressed; not merged (tag \texttt{pr1b-spikes}) & chain table and logs (Section~\ref{sec:pr1b}) \\
 PR2 & DMDA/decomposition compatibility spike & spike implemented, unmerged & passes 1--8 ranks \\
-PR2b & Multi-rank PCMG on torch shells & spike done (\texttt{b3dcd72}) & halos identical; telescope = redundant; 3D 8 its; PETSc-owned hierarchy rank-independent (Q1 9--10, cell-centred 9) \\
+PR2b & Multi-rank PCMG on torch shells & spike done (\texttt{b3dcd72}) & PETSc-owned hierarchy + cell-centred transfer adopted (user, 2026-10-18) \\
 PR2c & Non-SPD + torch PCSHELL smoother + fusion & proposed & --- \\
 PR3 & PetscFDSolverBase, single field, matrix-free & proposed & --- \\
 PR4 & BC terms in matrix-free operator application & proposed & --- \\
@@ -1477,8 +1506,8 @@ wrapping (Section~\ref{sec:soa}) is structurally possible, so the question
 is whether it is faster in practice once wrapped (PR1a decides this with
 real numbers); on MPS, no PETSc \texttt{Vec} type exists at all, so the
 torch-native path is the only option there regardless of what PR1a
-measures on CPU/CUDA. \textbf{Resolved 2026-10-18:} PETSc (KSPCG+PCMG on
-torch shells) is the default on CPU and CUDA (Section~\ref{sec:hybrid}).
+measures on CPU/CUDA. \textbf{Resolved 2026-10-18:} PETSc (KSPCG+PCMG,
+torch fine level) is the default on CPU and CUDA (Section~\ref{sec:hybrid}).
 \item Which solves PR3--PR6 need first (SPD-only vs.\ non-SPD), and whether
 MPS is a first-class target or torch-CG-only.
 \item Whether non-periodic BCs need special treatment on coarse PCMG levels
