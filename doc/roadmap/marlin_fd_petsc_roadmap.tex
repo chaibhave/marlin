@@ -12,6 +12,7 @@
 \usepackage{tcolorbox}
 \usepackage{amssymb}
 \usepackage{amsmath}
+\usepackage{siunitx}
 \usepackage[normalem]{ulem}
 \usepackage{listings}
 \usepackage{graphicx}
@@ -1269,7 +1270,7 @@ discretisation/coarse-operator question, not a smoother one.
 \textbf{Central advection at high Pe is deferred (user, 2026-10-18)} until a
 flow-coupled problem needs implicit advection: no current target physics has an
 advection term; high cell Pe would come from solute in a flowing melt
-($D\sim10^{-9}$~m$^2$/s, Pe $\sim1$--100 at $\mu$m grids). Options
+($D\sim\SI{e-9}{\metre\squared\per\second}$, Pe $\sim1$--100 at \si{\micro\metre} grids). Options
 then, each a separate numerical-method decision: explicit advection in $b$
 (implicit matrix stays SPD; CFL limit); an upwind-type implicit scheme; or a
 split (defect correction): enough of the advection implicit to keep the operator
