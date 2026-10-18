@@ -1266,6 +1266,17 @@ discretisation/coarse-operator question, not a smoother one.
 \item The traced smoother equals eager to the bit; on CPU it gives no speed-up
 (0.575 vs 0.571~ms per PCApply at $n=256$; 9.4 vs 9.0~ms at $n=1024$).
 \end{itemize}
+\textbf{Central advection at high Pe is deferred (user, 2026-10-18)} until a
+flow-coupled problem needs implicit advection: no current target physics has an
+advection term; high cell Pe would come from solute in a flowing melt
+($D\sim10^{-9}$~m$^2$/s, Pe $\sim1$--100 at $\mu$m grids). Options
+then, each a separate numerical-method decision: explicit advection in $b$
+(implicit matrix stays SPD; CFL limit); an upwind-type implicit scheme; or a
+split (defect correction): enough of the advection implicit to keep the operator
+well conditioned for multigrid, the remainder explicit in $b$, Picard-iterated.
+At Picard convergence this is the fully implicit solution of the target scheme
+(a truncated loop is a lagged scheme), and it converges only while the explicit
+remainder is small relative to the implicit part.
 Pending: the CUDA eager/traced/CUDA-graph sweep (\texttt{DISABLED\_CudaSmootherFusionSweep},
 H200; never compiled here).}
 
@@ -1486,7 +1497,7 @@ PR1a & Torch-native vs.\ PETSc matrix-free benchmark & CPU+CUDA verified, review
 PR1b & Multigrid spikes $\to$ hybrid design & reviewed, findings addressed; not merged (tag \texttt{pr1b-spikes}) & chain table and logs (Section~\ref{sec:pr1b}) \\
 PR2 & DMDA/decomposition compatibility spike & spike implemented, unmerged & passes 1--8 ranks \\
 PR2b & Multi-rank PCMG on torch shells & spike done (\texttt{b3dcd72}) & PETSc-owned hierarchy + cell-centred transfer adopted (user, 2026-10-18) \\
-PR2c & Non-SPD + torch PCSHELL smoother + fusion & CPU spike done (\texttt{40f6977}) & GS robust for upwind; Cheby/Jacobi fails at Pe $=10$; central Pe $\ge1$ unsolved; CUDA sweep pending \\
+PR2c & Non-SPD + torch PCSHELL smoother + fusion & CPU spike done (\texttt{40f6977}) & GS robust for upwind; Cheby/Jacobi fails at Pe $=10$; central Pe $\ge1$ deferred; CUDA sweep pending \\
 PR3 & PetscFDSolverBase, single field, matrix-free & proposed & --- \\
 PR4 & BC terms in matrix-free operator application & proposed & --- \\
 PR4a & AMG-preconditioned mixed mode (matrix-free Amat + assembled Pmat), contingent & proposed & --- \\
