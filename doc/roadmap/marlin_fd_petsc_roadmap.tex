@@ -154,10 +154,14 @@ hierarchy.} The fine level's DMDA is built on Marlin's partition;
 does not depend on the rank grid. Coarse levels are rediscretised and
 assembled; torch keeps the fine-level operator and the optional smoothers.
 Transfers are our cell-centred bilinear interpolation, assembled as an AIJ
-\texttt{Mat} from the DMDA numbering. It matches the cell-centred
-discretisation and gave 9 iterations against \texttt{DMDA\_Q1}'s 9--10 in
-PR2b: the best of the transfers tried, not proven optimal. Where the table
-above differs, this supersedes it:
+\texttt{Mat} from the DMDA numbering. It is the exact mapping for our
+cell-centred grid; PETSc's \texttt{DMDA\_Q1} is node-centred and would treat
+cell centres as vertices, an approximation from the geometry mismatch. In
+PR2b it gave 9 iterations against Q1's 9--10. The transfer depends only on the
+grid (cell-centred, factor-2 coarsening, dimension, per-axis boundary type),
+not on the operator: one shared routine (2D and 3D) serves every field and
+every \texttt{LinearFDOperator} term, and it is not part of the residual or
+the diagonal. Where the table above differs, this supersedes it:
 
 \begin{longtable}{p{0.36\textwidth} p{0.1\textwidth} p{0.44\textwidth}}
 \toprule
@@ -1229,7 +1233,7 @@ hierarchy. PETSc's coarse partition is chosen for vertex-based transfers, so our
 cell-centred interpolation is assembled with global column indices (a needed
 coarse cell can lie outside the one-cell ghost frame). \textbf{Decided (user,
 2026-10-18):} adopt this hierarchy (Section~\ref{sec:hybrid}) with the
-cell-centred transfer.
+cell-centred transfer (exact for our cell-centred grid; Q1 is node-centred).
 \item \textbf{3D, one rank.} 7-point operator, the same transfers applied axis
 by axis, assembled SeqAIJ coarse level: 8 iterations at $n=16/32/64$ with both
 \texttt{PCREDUNDANT} and telescope + LU, relative error $\le 8.7\times10^{-12}$.
