@@ -629,7 +629,8 @@ smoothers under GMRES are untested & SPD default does not cover all target
 physics & PR2c spike \\
 R10 & Fusion headroom of torch smoothers inside a PETSc callback is
 unmeasured (eager V-cycle floor $\sim$2~ms in both stacks) & Decides whether
-custom smoothers are worth their maintenance & PR2c, measured \\
+custom smoothers are worth their maintenance & PR2c: traced 2.4--3.2$\times$
+eager on H200; none on CPU \\
 \bottomrule
 \end{longtable}
 
@@ -1278,8 +1279,29 @@ well conditioned for multigrid, the remainder explicit in $b$, Picard-iterated.
 At Picard convergence this is the fully implicit solution of the target scheme
 (a truncated loop is a lagged scheme), and it converges only while the explicit
 remainder is small relative to the implicit part.
-Pending: the CUDA eager/traced/CUDA-graph sweep (\texttt{DISABLED\_CudaSmootherFusionSweep},
-H200; never compiled here).}
+\textbf{CUDA sweep (H200, \texttt{DISABLED\_CudaSmootherFusionSweep}), ms per
+\texttt{PCApply} of the fine RBGS PCSHELL:}
+\begin{center}
+\begin{tabular}{rrrr}
+\toprule
+$n$ & eager & traced (FuseGraph) & CUDA graph (eager captured) \\
+\midrule
+256 & 0.184 & 0.058 & 0.086 \\
+512 & 0.178 & 0.058 & 0.128 \\
+1024 & 0.345 & 0.142 & 0.285 \\
+2048 & 1.259 & 0.517 & 1.193 \\
+4096 & 4.487 & 1.859 & 4.464 \\
+8192 & 17.299 & 7.263 & 17.465 \\
+\bottomrule
+\end{tabular}
+\end{center}
+Tracing gives 2.4--3.2$\times$ at every size (fused kernels, less memory
+traffic); the CUDA graph only removes launch overhead (2.1$\times$ at $n=256$,
+none for $n\ge2048$). This answers R10: fusion is worth having on CUDA.
+The three modes agreed to round-off, but the run's check against the CPU eager
+reference failed (relative difference $\sim$1.3) because the CUDA input was drawn
+from the CUDA random generator; fixed in \texttt{63f0df1} (input drawn on the CPU
+and copied), rerun pending to confirm correctness.}
 
 \pr{3}{\texttt{PetscFDSolverBase}, Single Field, Matrix-Free, No Picard, No Nonlinear Remainder}
 \textbf{Hybrid-design update (2026-10-18):}
@@ -1498,7 +1520,7 @@ PR1a & Torch-native vs.\ PETSc matrix-free benchmark & CPU+CUDA verified, review
 PR1b & Multigrid spikes $\to$ hybrid design & reviewed, findings addressed; not merged (tag \texttt{pr1b-spikes}) & chain table and logs (Section~\ref{sec:pr1b}) \\
 PR2 & DMDA/decomposition compatibility spike & spike implemented, unmerged & passes 1--8 ranks \\
 PR2b & Multi-rank PCMG on torch shells & spike done (\texttt{b3dcd72}) & PETSc-owned hierarchy + cell-centred transfer adopted (user, 2026-10-18) \\
-PR2c & Non-SPD + torch PCSHELL smoother + fusion & CPU spike done (\texttt{40f6977}) & GS robust for upwind; Cheby/Jacobi fails at Pe $=10$; central Pe $\ge1$ deferred; CUDA sweep pending \\
+PR2c & Non-SPD + torch PCSHELL smoother + fusion & CPU spike done (\texttt{40f6977}) & GS robust for upwind; Cheby/Jacobi fails at Pe $=10$; central Pe $\ge1$ deferred; CUDA traced 2.4--3.2$\times$ eager (correctness rerun pending) \\
 PR3 & PetscFDSolverBase, single field, matrix-free & proposed & --- \\
 PR4 & BC terms in matrix-free operator application & proposed & --- \\
 PR4a & AMG-preconditioned mixed mode (matrix-free Amat + assembled Pmat), contingent & proposed & --- \\
