@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Generate PR1a benchmark figures directly from the gtest log files.
 
-Reads doc/roadmap/logs/petsc_torch_benchmark_{cpu,cuda}.log and produces:
+Reads doc/roadmap/logs/petsc_torch_benchmark_{cpu,cuda,cuda_sweep}.log (the
+last is the repeat-solve CUDA sweep, run 7) and produces:
   - timing_sweep.pdf: torch-native vs. PETSc zero-copy matrix-free solve
     wall-clock time vs. problem size n (CPU; CUDA absolute and per-unknown).
   - anisotropic_amg_vs_jacobi.pdf: Jacobi vs. AMG iteration count and
@@ -64,19 +65,31 @@ def parse_timing_sweep(log_text, petsc_label):
 
 
 def parse_cuda_sweep(log_text):
-    """Parse DISABLED_CudaTimingSweep: torch-native, torch-native with a
-    per-matvec device-to-device copy, and PETSc CUDA (setup, solve)."""
+    """Parse DISABLED_CudaTimingSweep. Every leg is solved twice back to back;
+    returns a dict of columns: n and, per leg, the first and repeat solve
+    times (ms) for torch-native, torch-native + per-matvec D2D copy, and PETSc
+    CUDA (plus PETSc's separately timed KSPSetUp)."""
     pattern = re.compile(
-        r"n=(\d+) torch-native: ([\d.]+)ms, \d+ iters \| "
-        r"torch-native \+ per-matvec D2D copy: ([\d.]+)ms, \d+ iters \| "
-        r"PETSc CUDA \(zero-copy Vec\): setup ([\d.]+)ms, solve ([\d.]+)ms"
+        r"n=(\d+) torch-native: ([\d.]+)ms, \d+ iters, repeat ([\d.]+)ms \| "
+        r"torch-native \+ per-matvec D2D copy: ([\d.]+)ms, \d+ iters, repeat ([\d.]+)ms \| "
+        r"PETSc CUDA \(zero-copy Vec\): setup ([\d.]+)ms, solve ([\d.]+)ms, "
+        r"\d+ iters, repeat solve ([\d.]+)ms"
     )
+    keys = [
+        "torch_first",
+        "torch_repeat",
+        "copy_first",
+        "copy_repeat",
+        "petsc_setup",
+        "petsc_first",
+        "petsc_repeat",
+    ]
     rows = [
         (int(m[1]),) + tuple(float(g) for g in m.groups()[1:])
         for m in pattern.finditer(log_text)
     ]
-    ns, torch_ms, copy_ms, setup_ms, petsc_ms = (list(c) for c in zip(*rows))
-    return ns, torch_ms, copy_ms, setup_ms, petsc_ms
+    columns = list(zip(*rows))
+    return {"n": list(columns[0]), **{k: list(c) for k, c in zip(keys, columns[1:])}}
 
 
 def parse_anisotropic(log_text, test_name):
@@ -108,9 +121,10 @@ def parse_anisotropic(log_text, test_name):
     }
 
 
-def plot_timing_sweep(cpu_log, cuda_log):
+def plot_timing_sweep(cpu_log, sweep_log):
     n_cpu, torch_cpu, petsc_cpu = parse_timing_sweep(cpu_log, " (zero-copy Vec)")
-    n_cu, torch_cu, copy_cu, _, petsc_cu = parse_cuda_sweep(cuda_log)
+    sweep = parse_cuda_sweep(sweep_log)
+    n_cu = sweep["n"]
 
     fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.6))
 
@@ -123,27 +137,46 @@ def plot_timing_sweep(cpu_log, cuda_log):
     ax.legend(loc="upper left")
     ax.grid(True, which="both", linewidth=0.4, alpha=0.3)
 
-    # CUDA: absolute time spans five decades (4 ms to 1.8 s), so it is shown
+    # CUDA: absolute time spans five decades (6 ms to 1.8 s), so it is shown
     # log-log; the right panel divides by unknowns and iterations to expose
-    # the launch-latency floor and the bandwidth-bound plateau.
-    ax = axes[1]
-    ax.loglog(n_cu, torch_cu, "o-", color=COLOR_TORCH, label="torch-native")
-    ax.loglog(n_cu, copy_cu, "^--", color=COLOR_COPY, label="torch-native + D2D copy")
-    ax.loglog(n_cu, petsc_cu, "s-", color=COLOR_PETSC, label="PETSc (zero-copy)")
-    ax.set_xlabel(r"$n$ (grid points per side)")
-    ax.set_ylabel("CG solve wall-clock time (ms)")
-    ax.set_title("CUDA (H200)")
-    ax.legend(loc="upper left", fontsize=7)
-    ax.grid(True, which="both", linewidth=0.4, alpha=0.3)
-
+    # the launch-latency floor and the bandwidth-bound plateau. Torch-native's
+    # first solve is not drawn: it equals its repeat solve to within 0.4% at
+    # n>=128. PETSc's first solve carries a one-off cost, drawn dotted.
+    legs = [
+        ("torch_repeat", "o-", COLOR_TORCH, "torch-native"),
+        ("copy_repeat", "^--", COLOR_COPY, "torch-native + D2D copy"),
+        ("petsc_repeat", "s-", COLOR_PETSC, "PETSc, repeat solve"),
+        ("petsc_first", "s:", COLOR_PETSC, "PETSc, first solve"),
+    ]
     iters = 32
     per_elem = lambda ms, ns: [
         t * 1e-3 / iters / (n * n) * 1e12 for t, n in zip(ms, ns)
     ]
+    ax = axes[1]
+    for key, style, color, label in legs:
+        ax.loglog(
+            n_cu,
+            sweep[key],
+            style,
+            color=color,
+            label=label,
+            alpha=0.55 if key == "petsc_first" else 1.0,
+        )
+    ax.set_xlabel(r"$n$ (grid points per side)")
+    ax.set_ylabel("CG solve wall-clock time (ms)")
+    ax.set_title("CUDA (H200)")
+    ax.legend(loc="upper left", fontsize=6.5)
+    ax.grid(True, which="both", linewidth=0.4, alpha=0.3)
+
     ax = axes[2]
-    ax.loglog(n_cu, per_elem(torch_cu, n_cu), "o-", color=COLOR_TORCH)
-    ax.loglog(n_cu, per_elem(copy_cu, n_cu), "^--", color=COLOR_COPY)
-    ax.loglog(n_cu, per_elem(petsc_cu, n_cu), "s-", color=COLOR_PETSC)
+    for key, style, color, _ in legs:
+        ax.loglog(
+            n_cu,
+            per_elem(sweep[key], n_cu),
+            style,
+            color=color,
+            alpha=0.55 if key == "petsc_first" else 1.0,
+        )
     ax.set_xlabel(r"$n$ (grid points per side)")
     ax.set_ylabel("time per unknown per iteration (ps)")
     ax.set_title("CUDA, normalized")
@@ -258,7 +291,8 @@ def plot_anisotropic(cpu_log, cuda_log):
 def main():
     cpu_log = (LOGS / "petsc_torch_benchmark_cpu.log").read_text()
     cuda_log = (LOGS / "petsc_torch_benchmark_cuda.log").read_text()
-    plot_timing_sweep(cpu_log, cuda_log)
+    sweep_log = (LOGS / "petsc_torch_benchmark_cuda_sweep.log").read_text()
+    plot_timing_sweep(cpu_log, sweep_log)
     plot_anisotropic(cpu_log, cuda_log)
     print("Wrote timing_sweep.pdf and anisotropic_amg_vs_jacobi.pdf")
 

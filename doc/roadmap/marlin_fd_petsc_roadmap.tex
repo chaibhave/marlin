@@ -707,8 +707,13 @@ unpreconditioned stopping test on both legs; 32 iterations at every size
 on both legs and both devices, confirming correctness is unaffected by
 which leg or device is used). CPU: macOS arm64, this machine. CUDA: H200.
 CUDA times are bracketed by \texttt{cudaDeviceSynchronize()}, and
-\texttt{KSPSetUp} is timed separately (0.03--0.06~ms at every size) so the
-PETSc column is the solve alone.
+\texttt{KSPSetUp} is timed separately (0.03--0.10~ms at every size). Every
+CUDA leg is solved twice back to back (``first'' and ``repeat'') for the
+reason given below. The CUDA table is from run~7, which was executed under
+\texttt{nsys profile} (NVTX ranges on); its absolute times are therefore
+slightly inflated by the profiler (launch-bound sizes $n\le512$ by up to
+$\sim$2.5~ms, large sizes by $\le$1\%, compared with the unprofiled run~5
+log), so the \textit{ratios} are the result, not the millisecond values.
 
 \begin{center}
 \footnotesize
@@ -729,23 +734,28 @@ $n$ & torch-native (CPU) & PETSc (CPU, zero-copy) & PETSc / torch \\
 
 \begin{center}
 \footnotesize
-\begin{tabular}{rrrrr}
+\begin{tabular}{rrrrrr}
 \toprule
-$n$ & torch-native (CUDA) & torch-native + D2D copy & PETSc (CUDA, zero-copy) & PETSc / torch \\
+$n$ & torch-native & torch + D2D copy & PETSc first & PETSc repeat & PETSc repeat / torch \\
 \midrule
-32 & 4.20 ms & 4.26 ms & 4.48 ms & 1.07 \\
-64 & 4.09 ms & 4.14 ms & 4.41 ms & 1.08 \\
-128 & 4.83 ms & 4.93 ms & 4.44 ms & 0.92 \\
-256 & 5.05 ms & 4.97 ms & 4.67 ms & 0.92 \\
-512 & 5.23 ms & 5.34 ms & 6.23 ms & 1.19 \\
-1024 & 7.75 ms & 7.67 ms & 11.0 ms & 1.41 \\
-2048 & 20.8 ms & 21.2 ms & 32.4 ms & 1.56 \\
-4096 & 72.5 ms & 74.4 ms & 120 ms & 1.65 \\
-8192 & 274 ms & 282 ms & 459 ms & 1.67 \\
-16384 & 1084 ms & 1117 ms & 1824 ms & 1.68 \\
+32 & 6.68 ms & 6.74 ms & 17.5 ms & 6.07 ms & 0.91 \\
+64 & 6.59 ms & 6.76 ms & 6.97 ms & 6.12 ms & 0.93 \\
+128 & 6.53 ms & 6.70 ms & 7.00 ms & 6.05 ms & 0.93 \\
+256 & 7.43 ms & 7.63 ms & 7.05 ms & 6.12 ms & 0.82 \\
+512 & 7.05 ms & 7.24 ms & 7.94 ms & 6.66 ms & 0.95 \\
+1024 & 9.08 ms & 9.18 ms & 12.4 ms & 8.79 ms & 0.97 \\
+2048 & 21.5 ms & 22.0 ms & 33.3 ms & 19.9 ms & 0.93 \\
+4096 & 73.7 ms & 75.8 ms & 119 ms & 65.8 ms & 0.89 \\
+8192 & 278 ms & 286 ms & 463 ms & 248 ms & 0.89 \\
+16384 & 1094 ms & 1128 ms & 1832 ms & 974 ms & 0.89 \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+Torch columns are the repeat solve. The first torch solve is within 0.4\% of
+it for $n\ge4096$ and within 4\% for every $64\le n\le2048$. Only $n=32$
+differs substantially (21.6 against 6.7~ms), because it is the process's
+first CUDA work.
 
 \begin{center}
 \includegraphics[width=\textwidth]{figures/timing_sweep.pdf}
@@ -754,38 +764,64 @@ $n$ & torch-native (CUDA) & torch-native + D2D copy & PETSc (CUDA, zero-copy) & 
 \textbf{CPU.} PETSc's matrix-free shell leg is faster than torch-native at
 every size: 15--19\% for $n\ge128$ (32\% at $n=32$).
 
-\textbf{CUDA.} Below $n\approx256$ both legs sit on a $\sim$4--5~ms floor
-(about 130~\textmu s per CG iteration) and are within 8\% of each other, so
-that regime measures launch latency, not the solver. From $n=512$ PETSc is
-slower, and the ratio rises to a plateau of 1.65--1.68$\times$ for
-$n\ge4096$ (up to $n=16384$, $2.7\times10^{8}$ unknowns, 58~GB of device
-memory in use). In the plateau the cost is a constant per unknown and
-iteration: 126~ps for torch-native and 212~ps for PETSc at $n=16384$, a
-gap of 86~ps.
+\textbf{CUDA, steady state.} Below $n\approx512$ every leg sits on a
+$\sim$6--7~ms floor (about 200~\textmu s per CG iteration under the
+profiler), so that regime measures launch latency, not the solver. For
+$n\ge4096$ the three legs are bandwidth bound ($n=16384$ is
+$2.7\times10^{8}$ unknowns, 58~GB of device memory in use) and the cost is a
+constant per unknown and iteration: 127~ps for torch-native, 131~ps for
+torch-native with the extra copy, and 113~ps for PETSc's repeat solve.
+\textbf{PETSc's repeat solve is faster than torch-native at every size,
+by 3--18\% (11\% at $n\ge4096$); the small-size values are within run-to-run
+noise of the launch floor and were not repeated.} It is also faster than the
+copy-paying torch leg (0.80--0.96$\times$, 0.87$\times$ at $n\ge4096$), which
+is the fairer comparison since \texttt{cudaShellMatMult} pays that copy too.
 
-\textbf{Is the gap the extra copy?} \texttt{cudaShellMatMult} must copy
-torch's convolution output into PETSc's \texttt{y} array, which torch-native
-does not do. The \texttt{torch-native + D2D copy} column pays that same
-device-to-device copy every matvec. It lands within 3\% of plain
-torch-native at every size ($\le$1.03$\times$), costing about 3.8~ps per
-unknown and iteration, so the copy explains $\sim$4~ps of the 86~ps gap. As
-a sanity check, 16~B of traffic (one read, one write) in 3.8~ps is
-$\approx$4.2~TB/s, which is the order of the H200's HBM3e peak (4.8~TB/s,
-vendor figure, not measured here). \textbf{The remaining $\sim$82~ps per
-unknown and iteration is not explained by the copy and is not yet
-explained at all.} From reading the code (not measured): both legs perform
-three blocking scalar reductions per CG iteration, and eager libtorch does
-not fuse kernels, so neither synchronization nor fusion obviously favors
-torch-native. Untested candidates are PETSc's \texttt{PCJACOBI} reading a
-diagonal \texttt{Vec} where torch scales by a scalar, and the cost of
-PETSc's CUDA vector kernels themselves. An \texttt{nsys} kernel and API
-summary of both legs is the next discriminating measurement.
+\textbf{First solve versus repeat solve.} PETSc's \emph{first}
+\texttt{KSPSolve} after \texttt{KSPSetUp} is slower than its repeat by a
+one-off cost that scales as $n^{2}$: 858~ms at $n=16384$, about 3.2~ns per
+unknown at every $n\ge2048$. It is the entire apparent ``PETSc is
+1.68$\times$ slower'' result of run~5; in run~7 the first-solve ratio to
+torch is 1.67. Torch-native has no such cost: its repeat solve equals its
+first. This was established in two steps, an \texttt{nsys} trace of run~5's
+sweep and a repeat solve added in runs~6 and~7 (PETSc's repeat time is
+identical in the two, 974.3~ms). In the trace of the first PETSc solve at
+$n=16384$ the GPU is idle for $\sim$780~ms of the 1860~ms: a $\sim$508~ms gap
+followed by a 39~ms device-to-host copy of about 2.1~GB, then a $\sim$270~ms
+gap followed by a 39~ms host-to-device copy of the same size. The profile
+shows ten \texttt{cudaMallocHost} calls (one per size, the largest 518~ms)
+and ten \texttt{VecCUDACopyFrom}/\texttt{VecCUDACopyTo} PETSc ranges, none
+of them inside CG iterations. That is consistent with PETSc allocating a
+pinned host mirror for the wrapped \texttt{Vec} and round-tripping the data
+once. The exact call that triggers it, whether it recurs when a wrapper
+\texttt{Vec} is recreated, and whether it can be avoided are \textbf{not
+established}. They matter for the design: at 3.2~ns per unknown the one-off
+cost is about 80\% of an entire 32-iteration torch-native solve (4.1~ns per
+unknown), so wrapper \texttt{Vec}s and the \texttt{KSP} must be created
+once and reused across solves, not rebuilt each step. PR3 must verify this
+on its own code path.
 
-R6 therefore still resolves \textit{per device}: zero-copy \texttt{Vec}
-wrapping (Section~\ref{sec:soa}) works correctly on both CPU and CUDA, PETSc
-is the faster leg on CPU, and torch-native is the faster leg on this GPU
-for $n\ge512$. The open question for PR3 is which leg to default to per
-device, not whether PETSc's hand-off overhead is prohibitive.
+\textbf{Where PETSc's steady-state advantage comes from.} The matvec is the
+same work in every leg: the \texttt{im2col} and \texttt{gemv} kernels total
+501~ms of GPU time at $n=16384$ in each leg (46\% of torch-native's busy
+time). Everything else is vector work. Torch-native spends 582~ms there in
+many ATen elementwise and reduction kernels; PETSc spends about 499~ms in
+cuBLAS \texttt{axpy}, \texttt{dot} and \texttt{nrm2} (first-solve trace,
+which also contains the 78~ms of host copies counted separately, so this
+is only a rough comparison). That fits the observed 14~ps, or $\sim$120~ms
+per solve, difference, but it is a reading of kernel totals, not a
+controlled experiment. Neither leg avoids synchronization: both perform
+three blocking scalar reductions per CG iteration (about 3 device-to-host
+copies per iteration in each leg's trace), so synchronization does not
+explain the difference, and eager libtorch fuses nothing. The extra
+device-to-device copy in \texttt{cudaShellMatMult} costs 3.9~ps per unknown
+and iteration (3.1\%), as the copy leg shows directly.
+
+R6 therefore resolves in PETSc's favour on both devices at steady state:
+zero-copy \texttt{Vec} wrapping (Section~\ref{sec:soa}) works correctly on
+CPU and CUDA, and the matrix-free PETSc leg is faster than torch-native on
+both, by 15--19\% on CPU and 3--18\% on this GPU (11\% at large $n$). The condition is the
+reuse requirement above; the first-solve cost is the open item.
 
 \textit{Ill-conditioned (anisotropic, R7/PR4a) comparison} ($n=64$,
 $D_x=1$, $D_y=10^{-4}$, $D_x/D_y=10^4$, same manufactured solution and
@@ -843,7 +879,13 @@ CUDA variant was added (commit \texttt{cb9368f}). Wall-clock timing was
 added next (commit \texttt{24527aa}) because iteration counts alone could
 not show which leg is faster. The initial wall-clock numbers charged
 PETSc's lazy \texttt{PCSetUp} to the first solve; the setup/solve/repeat
-split above (run~5) removes that.
+split above (run~5) removes that. The CUDA matrix-free sweep was
+originally reported as ``PETSc is 1.68$\times$ slower, $\sim$82~ps per unknown
+and iteration unexplained''. That compared PETSc's first solve with
+torch-native's first solve, and the gap was PETSc's one-off cost, not
+per-iteration work. Adding repeat solves to every leg (runs~6 and~7)
+withdrew that finding; the $\sim$82~ps figure and the plateau claim no
+longer stand.
 
 \textit{Assembled-\texttt{Mat} fallback scaling} (same isotropic problem as
 the timing sweep, a fully assembled \texttt{Mat} for both \texttt{Amat} and
@@ -893,16 +935,21 @@ inspection, rather than only the extracted tables above.
 
 \lstinputlisting[caption={Full CPU run log (\texttt{petsc\_torch\_benchmark\_cpu.log}), run~5 (setup/solve/repeat timing), 6/6 tests passing.}]{logs/petsc_torch_benchmark_cpu.log}
 
-\lstinputlisting[caption={Full CUDA run log (\texttt{petsc\_torch\_benchmark\_cuda.log}), run~5 on an H200 (setup/solve/repeat timing, device-to-device copy leg, sweep to $n=16384$), all 9/9 tests passing.}]{logs/petsc_torch_benchmark_cuda.log}
+\lstinputlisting[caption={Full CUDA run log (\texttt{petsc\_torch\_benchmark\_cuda.log}), run~5 on an H200, all 9/9 tests passing. Its \texttt{DISABLED\_CudaTimingSweep} lines time first solves only and are superseded by the repeat-solve log below; the other tests' lines (including the anisotropic CUDA test) are current.}]{logs/petsc_torch_benchmark_cuda.log}
+
+\lstinputlisting[caption={CUDA timing sweep with first and repeat solves for every leg (\texttt{petsc\_torch\_benchmark\_cuda\_sweep.log}), run~7 on an H200 under \texttt{nsys profile}, 1/1 tests passing.}]{logs/petsc_torch_benchmark_cuda_sweep.log}
 
 \status{implemented and verified on both CPU and CUDA, all 9 tests,
 2026-10-17 (commits \texttt{12016ae}, \texttt{41c2e31}, \texttt{19341d7},
-\texttt{cb9368f}, \texttt{24527aa} on branch \texttt{petsc\_torch\_benchmark}).
-R6 and R7 are both evidenced on CPU and CUDA. The CUDA slowdown of the
-PETSc leg (1.68$\times$ at large $n$) is real and only $\sim$4~ps of its
-86~ps per unknown and iteration is explained by the extra copy; the rest
-awaits an \texttt{nsys} profile. Remaining before this PR can be marked \texttt{verified} in
-the status-tracking table: the independent-reviewer-agent pass
+\texttt{cb9368f}, \texttt{24527aa}, \texttt{c77191a}, \texttt{5c38c75},
+\texttt{d0f8d60}, \texttt{3ac2c7c} on branch \texttt{petsc\_torch\_benchmark}).
+R6 and R7 are both evidenced on CPU and CUDA. At steady state PETSc's
+matrix-free leg is faster than torch-native on both devices (CUDA: 11\% at
+large $n$). Its first \texttt{KSPSolve} carries a one-off, $n^{2}$-scaling
+cost (3.2~ns per unknown) whose trigger and recurrence are not yet
+established; PR3 must reuse wrapper \texttt{Vec}s and the \texttt{KSP}.
+Remaining before this PR can be marked \texttt{verified} in the
+status-tracking table: the independent-reviewer-agent pass
 (Section~\ref{sec:gates}) has not yet been run on this diff.}
 
 \pr{2}{DMDA/Decomposition Compatibility Spike}
