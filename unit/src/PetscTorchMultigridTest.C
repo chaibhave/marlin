@@ -717,11 +717,11 @@ public:
 
   ~PicardMG()
   {
-    KSPDestroy(&_ksp);
+    PetscCallAbort(PETSC_COMM_SELF, KSPDestroy(&_ksp));
     for (auto & m : _A)
-      MatDestroy(&m);
+      PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&m));
     for (auto & m : _transfers)
-      MatDestroy(&m);
+      PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&m));
   }
 
   KSP ksp() const { return _ksp; }
