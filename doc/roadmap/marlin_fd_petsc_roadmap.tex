@@ -1565,7 +1565,12 @@ torch-native path is the only option there regardless of what PR1a
 measures on CPU/CUDA. \textbf{Resolved 2026-10-18:} PETSc (KSPCG+PCMG,
 torch fine level) is the default on CPU and CUDA (Section~\ref{sec:hybrid}).
 \item Which solves PR3--PR6 need first (SPD-only vs.\ non-SPD), and whether
-MPS is a first-class target or torch-CG-only.
+MPS is a first-class target or torch-CG-only. \textbf{MPS resolved
+2026-10-18 (user):} MPS is supported through one route for now, the existing
+torch-native PCG (\texttt{conjugateGradientSolve}) reused in the solver block.
+The torch smoothers written for PETSc's \texttt{PCSHELL} are reused as its
+preconditioner, which also serves pure-torch builds (no PETSc, or no CUDA
+PETSc). More complex solvers on MPS are deferred.
 \item Whether non-periodic BCs need special treatment on coarse PCMG levels
 (rediscretised BC rows vs.\ Galerkin) --- check in PR2b/PR4.
 \end{enumerate}
