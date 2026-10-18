@@ -22,12 +22,30 @@
 // prolongation P, restriction P^T/4, rediscretized coarse operators (spacing
 // doubles), dense inverse at n=8 (stands in for an allgather plus redundant
 // coarse solve). Outer solver: the existing MooseTensor::conjugateGradientSolve.
+//
+// DISABLED_CudaVcycleTimingSweep times the same V-cycle on one CUDA device
+// (single slab, no MPI) against Jacobi-CG, to see whether the many small
+// kernel launches on the coarse levels dominate. Run it on a GPU machine with
+//   --gtest_also_run_disabled_tests --gtest_filter='*DISABLED_CudaVcycleTimingSweep'
+// (optionally under nsys; each phase carries an NVTX range).
 
 #include "MarlinUtils.h"
 #include "MooseError.h"
 #include "gtest/gtest.h"
 
+#include <torch/cuda.h>
+
+#include <array>
+#include <chrono>
+#include <string>
 #include <vector>
+
+#if defined(__has_include)
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define MARLIN_SPIKE_HAS_NVTX 1
+#endif
+#endif
 
 namespace
 {
@@ -41,7 +59,7 @@ using Slabs = std::vector<torch::Tensor>;
 class SlabMultigrid
 {
 public:
-  SlabMultigrid(int64_t n, int64_t slabs) : _slabs(slabs)
+  SlabMultigrid(int64_t n, int64_t slabs, torch::Device device = torch::kCPU) : _slabs(slabs)
   {
     for (int64_t level_n = n; level_n >= coarsest_n; level_n /= 2)
     {
@@ -56,10 +74,11 @@ public:
     // vectors, then inverted once.
     const int64_t nc = coarsest_n;
     const double h2 = _h2.back();
-    auto columns = torch::zeros({nc * nc, nc * nc}, torch::kDouble);
+    const auto dopts = torch::TensorOptions().dtype(torch::kDouble).device(device);
+    auto columns = torch::zeros({nc * nc, nc * nc}, dopts);
     for (int64_t k = 0; k < nc * nc; ++k)
     {
-      auto e = torch::zeros({nc, nc}, torch::kDouble);
+      auto e = torch::zeros({nc, nc}, dopts);
       e[k / nc][k % nc] = 1.0;
       auto Ae = (4.0 * e - torch::roll(e, 1, 0) - torch::roll(e, -1, 0) - torch::roll(e, 1, 1) -
                  torch::roll(e, -1, 1)) /
@@ -68,6 +87,23 @@ public:
       columns.select(1, k).copy_(Ae.reshape({-1}));
     }
     _coarse_inverse = torch::inverse(columns);
+
+    // Red/black masks depend only on level, slab and colour: build them once so
+    // the smoother launches no index-arithmetic kernels.
+    const auto iopts = torch::TensorOptions().dtype(torch::kInt64).device(device);
+    for (const int64_t level_n : _n)
+    {
+      const int64_t m = level_n / slabs;
+      const auto cols = torch::arange(level_n, iopts).unsqueeze(0);
+      std::vector<std::array<torch::Tensor, 2>> level_masks;
+      for (int64_t p = 0; p < slabs; ++p)
+      {
+        const auto global_rows = (torch::arange(m, iopts) + p * m).unsqueeze(1);
+        const auto parity = (global_rows + cols) % 2;
+        level_masks.push_back({parity == 0, parity == 1});
+      }
+      _masks.push_back(level_masks);
+    }
   }
 
   /// A x on the finest level; x and the result are flat length-n^2 vectors.
@@ -151,13 +187,11 @@ private:
   /// slabs, followed by the ghost exchange it needs.
   void smooth(Slabs & u, const Slabs & f, int64_t level, int64_t color) const
   {
-    const int64_t n = _n[level], m = rows(level);
-    const auto cols = torch::arange(n).unsqueeze(0);
+    const int64_t m = rows(level);
     for (int64_t p = 0; p < _slabs; ++p)
     {
       auto owned = u[p].narrow(0, 1, m);
-      const auto global_rows = (torch::arange(m) + p * m).unsqueeze(1);
-      const auto mask = ((global_rows + cols) % 2) == color;
+      const auto & mask = _masks[level][p][color];
       auto neighbours = u[p].narrow(0, 0, m) + u[p].narrow(0, 2, m) + torch::roll(owned, 1, 1) +
                         torch::roll(owned, -1, 1);
       auto updated = (f[p].narrow(0, 1, m) + neighbours / _h2[level]) / (4.0 / _h2[level] + sigma);
@@ -244,6 +278,7 @@ private:
   std::vector<int64_t> _n;
   std::vector<double> _h2;
   torch::Tensor _coarse_inverse;
+  std::vector<std::vector<std::array<torch::Tensor, 2>>> _masks; // [level][slab][colour]
 };
 
 struct SolveResult
@@ -320,5 +355,125 @@ TEST(TorchMultigridSpikeTest, SlabCountDoesNotChangeTheSolution)
                << "), max |x - x_1slab| = " << diff << "\n";
     EXPECT_EQ(result.its, reference.its);
     EXPECT_LT(diff, 1e-12 * reference.x.abs().max().item<double>());
+  }
+}
+
+namespace
+{
+/// NVTX range around a timed phase (no-op if the NVTX headers are absent).
+class Range
+{
+public:
+  explicit Range(const std::string & name)
+  {
+#ifdef MARLIN_SPIKE_HAS_NVTX
+    nvtxRangePushA(name.c_str());
+#else
+    (void)name;
+#endif
+  }
+  ~Range()
+  {
+#ifdef MARLIN_SPIKE_HAS_NVTX
+    nvtxRangePop();
+#endif
+  }
+};
+
+/// Wall time of fn() in ms, bracketed by device synchronization.
+template <typename F>
+double
+timedMs(const std::string & label, F fn)
+{
+  torch::cuda::synchronize();
+  Range range(label);
+  const auto t0 = std::chrono::steady_clock::now();
+  fn();
+  torch::cuda::synchronize();
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+} // namespace
+
+// Timing only: no pass/fail on speed. Each solve runs twice (first, repeat) as
+// in the PETSc benchmark, since first calls carry one-off costs.
+TEST(TorchMultigridSpikeTest, DISABLED_CudaVcycleTimingSweep)
+{
+  ASSERT_TRUE(torch::cuda::is_available()) << "needs a CUDA-enabled libtorch and a GPU";
+  const torch::Device device(torch::kCUDA, 0);
+  const auto dopts = torch::TensorOptions().dtype(torch::kDouble).device(device);
+  constexpr int vcycle_reps = 20;
+  constexpr int64_t jacobi_maxiter = 20000;
+
+  torch::manual_seed(0);
+  for (const int64_t n : {256, 512, 1024, 2048, 4096, 8192})
+  {
+    const std::string tag = " n=" + std::to_string(n);
+    SlabMultigrid mg(n, 1, device);
+    const auto b = torch::randn({n * n}, dopts);
+    const double inv_diag = 1.0 / (4.0 * n * n + sigma);
+    auto A = [&](const torch::Tensor & x) { return mg.apply(x); };
+    auto M_mg = [&](const torch::Tensor & r) { return mg.precondition(r); };
+    auto M_jac = [&](const torch::Tensor & r) { return r * inv_diag; };
+
+    // Warm-up so allocator/cuBLAS setup is out of the isolated kernels.
+    (void)mg.precondition(b);
+    (void)mg.apply(b);
+
+    const double vcycle_ms = timedMs("vcycle x20" + tag,
+                                     [&]
+                                     {
+                                       for (int i = 0; i < vcycle_reps; ++i)
+                                         (void)mg.precondition(b);
+                                     }) /
+                             vcycle_reps;
+    const double matvec_ms = timedMs("matvec x20" + tag,
+                                     [&]
+                                     {
+                                       for (int i = 0; i < vcycle_reps; ++i)
+                                         (void)mg.apply(b);
+                                     }) /
+                             vcycle_reps;
+
+    unsigned int mg_its = 0, jac_its = 0;
+    double mg_first = timedMs("MG-PCG first" + tag,
+                              [&]
+                              {
+                                mg_its = std::get<1>(MooseTensor::conjugateGradientSolve(
+                                    A, b, torch::Tensor(), rel_tol, 0, M_mg));
+                              });
+    double mg_repeat = timedMs("MG-PCG repeat" + tag,
+                               [&]
+                               {
+                                 mg_its = std::get<1>(MooseTensor::conjugateGradientSolve(
+                                     A, b, torch::Tensor(), rel_tol, 0, M_mg));
+                               });
+    double jac_first = timedMs("Jacobi-CG first" + tag,
+                               [&]
+                               {
+                                 jac_its = std::get<1>(MooseTensor::conjugateGradientSolve(
+                                     A, b, torch::Tensor(), rel_tol, jacobi_maxiter, M_jac));
+                               });
+    double jac_repeat = timedMs("Jacobi-CG repeat" + tag,
+                                [&]
+                                {
+                                  jac_its = std::get<1>(MooseTensor::conjugateGradientSolve(
+                                      A, b, torch::Tensor(), rel_tol, jacobi_maxiter, M_jac));
+                                });
+
+    printf("n=%ld V-cycle %.3f ms, matvec %.3f ms (ratio %.1f) | MG-PCG: %u its, %.1f ms, repeat "
+           "%.1f ms (%.3f ms/it) | Jacobi-CG: %u its%s, %.1f ms, repeat %.1f ms (%.3f ms/it)\n",
+           long(n),
+           vcycle_ms,
+           matvec_ms,
+           vcycle_ms / matvec_ms,
+           mg_its,
+           mg_first,
+           mg_repeat,
+           mg_repeat / mg_its,
+           jac_its,
+           jac_its >= jacobi_maxiter ? " (hit maxiter)" : "",
+           jac_first,
+           jac_repeat,
+           jac_repeat / jac_its);
   }
 }
