@@ -687,6 +687,256 @@ worldRank()
   MPI_Comm_rank(MPI_COMM_WORLD, &r);
   return r;
 }
+// ---- 3D check, one rank (PR2b: "the transfers and the coarse solve generalise") ----
+// Periodic 3D  A u = -Laplacian(u) + sigma u, 7-point stencil, h = 1/n; same transfers
+// applied along all three axes (scale (1/2)^3), coarsest level an assembled SeqAIJ with
+// the same coarse-solve options as in 2D.
+
+/// Periodic one-cell pad along `axis` only (restrictAxis / prolongAxis read ghosts
+/// only along the axis they act on).
+torch::Tensor
+padAxis(const torch::Tensor & t, int64_t axis)
+{
+  const int64_t m = t.size(axis);
+  return torch::cat({t.narrow(axis, m - 1, 1), t, t.narrow(axis, 0, 1)}, axis);
+}
+
+struct Level3d
+{
+  int64_t n;
+  double h2;
+};
+
+torch::Tensor
+apply3d(const torch::Tensor & u, double h2)
+{
+  auto nb = torch::zeros_like(u);
+  for (const int64_t axis : {0, 1, 2})
+  {
+    const auto g = padAxis(u, axis);
+    const int64_t m = u.size(axis);
+    nb += g.narrow(axis, 0, m) + g.narrow(axis, 2, m);
+  }
+  return (6.0 * u - nb) / h2 + sigma * u;
+}
+
+PetscErrorCode
+levelMult3d(Mat A, Vec x, Vec y)
+{
+  Level3d * c;
+  PetscCall(MatShellGetContext(A, &c));
+  const PetscScalar * xa;
+  PetscScalar * ya;
+  PetscCall(VecGetArrayRead(x, &xa));
+  PetscCall(VecGetArrayWrite(y, &ya));
+  const auto opt = torch::TensorOptions().dtype(torch::kDouble);
+  const auto u = torch::from_blob(const_cast<PetscScalar *>(xa), {c->n, c->n, c->n}, opt);
+  torch::from_blob(ya, {c->n, c->n, c->n}, opt).copy_(apply3d(u, c->h2));
+  PetscCall(VecRestoreArrayRead(x, &xa));
+  PetscCall(VecRestoreArrayWrite(y, &ya));
+  return PETSC_SUCCESS;
+}
+
+PetscErrorCode
+levelDiagonal3d(Mat A, Vec diag)
+{
+  Level3d * c;
+  PetscCall(MatShellGetContext(A, &c));
+  PetscCall(VecSet(diag, 6.0 / c->h2 + sigma));
+  return PETSC_SUCCESS;
+}
+
+/// Transfer shells carry the FINE level's context; transfers act axis by axis.
+PetscErrorCode
+prolongMult3d(Mat P, Vec coarse, Vec fine)
+{
+  Level3d * c;
+  PetscCall(MatShellGetContext(P, &c));
+  const int64_t n = c->n, nc = n / 2;
+  const PetscScalar * xa;
+  PetscScalar * ya;
+  PetscCall(VecGetArrayRead(coarse, &xa));
+  PetscCall(VecGetArrayWrite(fine, &ya));
+  const auto opt = torch::TensorOptions().dtype(torch::kDouble);
+  auto t = torch::from_blob(const_cast<PetscScalar *>(xa), {nc, nc, nc}, opt);
+  for (const int64_t axis : {2, 1, 0})
+    t = prolongAxis(padAxis(t, axis), axis);
+  torch::from_blob(ya, {n, n, n}, opt).copy_(t);
+  PetscCall(VecRestoreArrayRead(coarse, &xa));
+  PetscCall(VecRestoreArrayWrite(fine, &ya));
+  return PETSC_SUCCESS;
+}
+
+PetscErrorCode
+restrictMult3d(Mat R, Vec fine, Vec coarse)
+{
+  Level3d * c;
+  PetscCall(MatShellGetContext(R, &c));
+  const int64_t n = c->n, nc = n / 2;
+  const PetscScalar * xa;
+  PetscScalar * ya;
+  PetscCall(VecGetArrayRead(fine, &xa));
+  PetscCall(VecGetArrayWrite(coarse, &ya));
+  const auto opt = torch::TensorOptions().dtype(torch::kDouble);
+  auto t = torch::from_blob(const_cast<PetscScalar *>(xa), {n, n, n}, opt);
+  for (const int64_t axis : {2, 1, 0})
+    t = restrictAxis(padAxis(t, axis), axis);
+  torch::from_blob(ya, {nc, nc, nc}, opt).copy_(t / 8.0);
+  PetscCall(VecRestoreArrayRead(fine, &xa));
+  PetscCall(VecRestoreArrayWrite(coarse, &ya));
+  return PETSC_SUCCESS;
+}
+
+Mat
+makeCoarseAIJ3d(const Level3d & c)
+{
+  const int64_t n = c.n, N = n * n * n;
+  auto row = [&](int64_t i, int64_t j, int64_t k)
+  { return PetscInt((((i + n) % n) * n + (j + n) % n) * n + (k + n) % n); };
+  Mat A;
+  PetscCallAbort(PETSC_COMM_SELF, MatCreateSeqAIJ(PETSC_COMM_SELF, N, N, 7, nullptr, &A));
+  const PetscScalar off = -1.0 / c.h2, diag = 6.0 / c.h2 + sigma;
+  for (int64_t i = 0; i < n; ++i)
+    for (int64_t j = 0; j < n; ++j)
+      for (int64_t k = 0; k < n; ++k)
+      {
+        const PetscInt r = row(i, j, k);
+        const PetscInt cols[7] = {r,
+                                  row(i - 1, j, k),
+                                  row(i + 1, j, k),
+                                  row(i, j - 1, k),
+                                  row(i, j + 1, k),
+                                  row(i, j, k - 1),
+                                  row(i, j, k + 1)};
+        const PetscScalar vals[7] = {diag, off, off, off, off, off, off};
+        PetscCallAbort(PETSC_COMM_SELF, MatSetValues(A, 1, &r, 7, cols, vals, ADD_VALUES));
+      }
+  PetscCallAbort(PETSC_COMM_SELF, MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY));
+  PetscCallAbort(PETSC_COMM_SELF, MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY));
+  return A;
+}
+
+RunResult
+solvePcmg3d(int64_t n, CoarseSolver coarse_solver)
+{
+  const MPI_Comm comm = PETSC_COMM_SELF;
+  std::vector<std::unique_ptr<Level3d>> levels; // coarse to fine
+  for (int64_t level_n = n; level_n >= coarsest_n; level_n /= 2)
+    levels.insert(levels.begin(),
+                  std::make_unique<Level3d>(Level3d{level_n, 1.0 / (double(level_n) * level_n)}));
+  const PetscInt nlev = levels.size();
+
+  std::vector<Mat> A(nlev);
+  A[0] = makeCoarseAIJ3d(*levels[0]);
+  for (PetscInt l = 1; l < nlev; ++l)
+  {
+    const int64_t N = levels[l]->n * levels[l]->n * levels[l]->n;
+    PetscCallAbort(comm, MatCreateShell(comm, N, N, N, N, levels[l].get(), &A[l]));
+    PetscCallAbort(comm, MatShellSetOperation(A[l], MATOP_MULT, (void (*)(void))levelMult3d));
+    PetscCallAbort(comm,
+                   MatShellSetOperation(A[l], MATOP_GET_DIAGONAL, (void (*)(void))levelDiagonal3d));
+  }
+  for (auto & m : A)
+  {
+    PetscCallAbort(comm, MatSetOption(m, MAT_SPD, PETSC_TRUE));
+    PetscCallAbort(comm, MatSetOption(m, MAT_SPD_ETERNAL, PETSC_TRUE));
+  }
+
+  KSP ksp;
+  PC pc;
+  PetscCallAbort(comm, KSPCreate(comm, &ksp));
+  PetscCallAbort(comm, KSPSetOperators(ksp, A[nlev - 1], A[nlev - 1]));
+  PetscCallAbort(comm, KSPSetType(ksp, KSPCG));
+  PetscCallAbort(comm, KSPSetNormType(ksp, KSP_NORM_UNPRECONDITIONED));
+  PetscCallAbort(comm, KSPSetTolerances(ksp, rel_tol, 0.0, PETSC_DEFAULT, 1000));
+  PetscCallAbort(comm, KSPGetPC(ksp, &pc));
+  PetscCallAbort(comm, PCSetType(pc, PCMG));
+  PetscCallAbort(comm, PCMGSetLevels(pc, nlev, nullptr));
+  PetscCallAbort(comm, PCMGSetType(pc, PC_MG_MULTIPLICATIVE));
+  PetscCallAbort(comm, PCMGSetCycleType(pc, PC_MG_CYCLE_V));
+
+  std::vector<Mat> transfers;
+  for (PetscInt l = 1; l < nlev; ++l)
+  {
+    const int64_t fN = levels[l]->n * levels[l]->n * levels[l]->n, cN = fN / 8;
+    Mat P, R;
+    PetscCallAbort(comm, MatCreateShell(comm, fN, cN, fN, cN, levels[l].get(), &P));
+    PetscCallAbort(comm, MatShellSetOperation(P, MATOP_MULT, (void (*)(void))prolongMult3d));
+    PetscCallAbort(comm, MatCreateShell(comm, cN, fN, cN, fN, levels[l].get(), &R));
+    PetscCallAbort(comm, MatShellSetOperation(R, MATOP_MULT, (void (*)(void))restrictMult3d));
+    PetscCallAbort(comm, PCMGSetInterpolation(pc, l, P));
+    PetscCallAbort(comm, PCMGSetRestriction(pc, l, R));
+    transfers.push_back(P);
+    transfers.push_back(R);
+  }
+  for (PetscInt l = 0; l < nlev; ++l)
+  {
+    KSP smoother;
+    PC smoother_pc;
+    PetscCallAbort(comm, PCMGGetSmoother(pc, l, &smoother));
+    PetscCallAbort(comm, KSPSetOperators(smoother, A[l], A[l]));
+    PetscCallAbort(comm, KSPGetPC(smoother, &smoother_pc));
+    if (l == 0)
+    {
+      PetscCallAbort(comm, KSPSetType(smoother, KSPPREONLY));
+      PetscCallAbort(
+          comm,
+          PCSetType(smoother_pc,
+                    coarse_solver == CoarseSolver::Redundant ? PCREDUNDANT : PCTELESCOPE));
+    }
+    else
+    {
+      PetscCallAbort(comm, KSPSetType(smoother, KSPCHEBYSHEV));
+      PetscCallAbort(comm, PCSetType(smoother_pc, PCJACOBI));
+      PetscCallAbort(comm, KSPSetTolerances(smoother, 0, 0, PETSC_DEFAULT, 2));
+      PetscCallAbort(comm, KSPSetNormType(smoother, KSP_NORM_NONE));
+    }
+  }
+  if (coarse_solver != CoarseSolver::Redundant)
+  {
+    PetscCallAbort(comm, KSPSetUp(ksp));
+    KSP coarse, inner;
+    PC coarse_pc, inner_pc;
+    PetscCallAbort(comm, PCMGGetCoarseSolve(pc, &coarse));
+    PetscCallAbort(comm, KSPGetPC(coarse, &coarse_pc));
+    PetscCallAbort(comm, PCTelescopeGetKSP(coarse_pc, &inner));
+    PetscCallAbort(comm, KSPGetPC(inner, &inner_pc));
+    PetscCallAbort(comm,
+                   PCSetType(inner_pc, coarse_solver == CoarseSolver::TelescopeLU ? PCLU : PCGAMG));
+  }
+
+  const auto xs = (torch::arange(n, torch::kDouble) + 0.5) / n;
+  const double two_pi = 2.0 * M_PI;
+  const auto x_exact =
+      (torch::sin(two_pi * xs).view({-1, 1, 1}) * torch::cos(2.0 * two_pi * xs).view({1, -1, 1}) +
+       0.5 * torch::cos(3.0 * two_pi * xs).view({-1, 1, 1}) +
+       0.25 * torch::sin(two_pi * xs).view({1, 1, -1}) * torch::cos(two_pi * xs).view({1, -1, 1}))
+          .contiguous();
+  auto b = apply3d(x_exact, levels.back()->h2).contiguous();
+  auto x = torch::zeros_like(b);
+  Vec b_vec, x_vec;
+  PetscCallAbort(comm, VecCreateSeqWithArray(comm, 1, b.numel(), b.data_ptr<double>(), &b_vec));
+  PetscCallAbort(comm, VecCreateSeqWithArray(comm, 1, x.numel(), x.data_ptr<double>(), &x_vec));
+  PetscCallAbort(comm, KSPSolve(ksp, b_vec, x_vec));
+
+  RunResult result{};
+  PetscCallAbort(comm, KSPGetIterationNumber(ksp, &result.its));
+  PetscCallAbort(comm, KSPGetConvergedReason(ksp, &result.reason));
+  result.relative_error = ((x - x_exact).norm() / x_exact.norm()).item<double>();
+  result.levels = int(nlev);
+  result.coarse_n = levels[0]->n;
+  result.sum = x.sum().item<double>();
+  result.sumsq = (x * x).sum().item<double>();
+
+  PetscCallAbort(comm, VecDestroy(&b_vec));
+  PetscCallAbort(comm, VecDestroy(&x_vec));
+  PetscCallAbort(comm, KSPDestroy(&ksp));
+  for (auto & m : A)
+    PetscCallAbort(comm, MatDestroy(&m));
+  for (auto & m : transfers)
+    PetscCallAbort(comm, MatDestroy(&m));
+  return result;
+}
 } // namespace
 
 TEST(PetscTorchMultigridMPISpikeTest, PcmgOnShellsIsRankCountIndependent)
@@ -804,4 +1054,34 @@ TEST(PetscTorchMultigridMPISpikeTest, DmdaHaloMatchesOwnExchange)
     EXPECT_LT(dmda.relative_error, 1e-8);
     EXPECT_NEAR(dmda.sumsq, own.sumsq, 1e-9 * own.sumsq);
   }
+}
+
+// 3D on one rank: the transfers applied along three axes and the assembled coarse solve
+// generalise if the iteration count stays flat in n (grid independence) and the
+// manufactured solution is recovered to round-off.
+TEST(PetscTorchMultigridMPISpikeTest, Pcmg3dOneRankIsGridIndependent)
+{
+  if (worldRank() != 0)
+    return; // one-rank check; the other ranks have nothing to do
+  std::vector<PetscInt> its;
+  for (const int64_t n : {16, 32, 64})
+  {
+    const auto r = solvePcmg3d(n, CoarseSolver::Redundant);
+    const auto t = solvePcmg3d(n, CoarseSolver::TelescopeLU);
+    printf("3D n=%ld levels=%d coarse n=%ld KSPCG+PCMG: %d its (telescope+LU %d), reason %d, "
+           "relative error %.3e\n",
+           long(n),
+           r.levels,
+           long(r.coarse_n),
+           int(r.its),
+           int(t.its),
+           int(r.reason),
+           r.relative_error);
+    EXPECT_GT(r.reason, 0);
+    EXPECT_LT(r.relative_error, 1e-8);
+    EXPECT_EQ(t.its, r.its);
+    its.push_back(r.its);
+  }
+  EXPECT_LE(*std::max_element(its.begin(), its.end()) - *std::min_element(its.begin(), its.end()),
+            1);
 }
