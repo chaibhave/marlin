@@ -785,21 +785,46 @@ unknown at every $n\ge2048$. It is the entire apparent ``PETSc is
 torch is 1.67. Torch-native has no such cost: its repeat solve equals its
 first. This was established in two steps, an \texttt{nsys} trace of run~5's
 sweep and a repeat solve added in runs~6 and~7 (PETSc's repeat time is
-identical in the two, 974.3~ms). In the trace of the first PETSc solve at
-$n=16384$ the GPU is idle for $\sim$780~ms of the 1860~ms: a $\sim$508~ms gap
-followed by a 39~ms device-to-host copy of about 2.1~GB, then a $\sim$270~ms
-gap followed by a 39~ms host-to-device copy of the same size. The profile
-shows ten \texttt{cudaMallocHost} calls (one per size, the largest 518~ms)
-and ten \texttt{VecCUDACopyFrom}/\texttt{VecCUDACopyTo} PETSc ranges, none
-of them inside CG iterations. That is consistent with PETSc allocating a
-pinned host mirror for the wrapped \texttt{Vec} and round-tripping the data
-once. The exact call that triggers it, whether it recurs when a wrapper
-\texttt{Vec} is recreated, and whether it can be avoided are \textbf{not
-established}. They matter for the design: at 3.2~ns per unknown the one-off
-cost is about 80\% of an entire 32-iteration torch-native solve (4.1~ns per
-unknown), so wrapper \texttt{Vec}s and the \texttt{KSP} must be created
-once and reused across solves, not rebuilt each step. PR3 must verify this
-on its own code path.
+identical in the two, 974.3~ms).
+
+\textit{Mechanism} (read from the PETSc 3.25.4 source and matched call for
+call against the trace; the \texttt{jacobi.c} lines were rechecked by hand,
+but nothing here has been confirmed by an experiment yet). The cost is not in
+the wrapped \texttt{b} and \texttt{x} Vecs; it is in \texttt{PCJACOBI}'s
+diagonal \texttt{Vec}. \texttt{KSPSetUp} does no Jacobi work because
+\texttt{jac->diag} does not exist yet, which is why it takes only 0.04~ms.
+\texttt{PCApply\_Jacobi} creates the diagonal lazily on the first
+application, which for the unpreconditioned stopping test happens before the
+CG loop starts. \texttt{MatGetDiagonal} (the shell's callback) and
+\texttt{VecReciprocal} run on the GPU. Then, because \texttt{fixdiag}
+(replace a zero diagonal entry by 1) defaults on and the shell is not known
+to be SPD, PETSc reads the diagonal on the host (\texttt{VecGetArray}) and
+loops over all $n^{2}$ entries. That forces a pinned host allocation (the
+$\sim$508~ms \texttt{cudaMallocHost}), a 39~ms device-to-host copy of the
+2.1~GB vector, the host loop (the $\sim$270~ms gap, an inference: no other
+code runs between the two copies), and a 39~ms copy back. This replaces my
+earlier guess that PETSc round-trips a mirror of the wrapped \texttt{Vec}s;
+that was wrong. No CG iteration runs before the stall.
+
+\textit{Recurrence.} From the source: not for the same \texttt{KSP} with
+unchanged operators, including after wrapping new \texttt{Vec}s over the
+same buffers. It does recur in full for a newly created \texttt{KSP}/\texttt{PC}. If
+the operator's state changes on an existing \texttt{PC}, the diagonal is
+rebuilt and the host loop and both copies return, but not the pinned
+allocation. Whether the Marlin Picard loop changes the \texttt{Mat} state
+every iteration is not yet known and decides how often this is paid.
+
+The cost belongs to \texttt{PCJACOBI}'s setup rather than to zero-copy
+wrapping, so a different preconditioner would not pay it. It is avoidable
+by configuration, but each option is a numerical choice:
+\texttt{PCJacobiSetFixDiagonal(pc, PETSC\_FALSE)} would stop zero diagonal
+entries being replaced by 1 (identical results here, where the diagonal is a
+nonzero constant) and \texttt{MatSetOption(mat, MAT\_SPD, PETSC\_TRUE)}
+asserts the operator is SPD. Neither has been tried. At 3.2~ns per unknown
+the one-off cost is about 80\% of an entire 32-iteration torch-native solve
+(4.1~ns per unknown), so creating the \texttt{KSP}/\texttt{PC} once and
+reusing it across solves matters until this is settled. PR3 must verify
+this on its own code path.
 
 \textbf{Where PETSc's steady-state advantage comes from.} The matvec is the
 same work in every leg: the \texttt{im2col} and \texttt{gemv} kernels total
@@ -946,8 +971,9 @@ inspection, rather than only the extracted tables above.
 R6 and R7 are both evidenced on CPU and CUDA. At steady state PETSc's
 matrix-free leg is faster than torch-native on both devices (CUDA: 11\% at
 large $n$). Its first \texttt{KSPSolve} carries a one-off, $n^{2}$-scaling
-cost (3.2~ns per unknown) whose trigger and recurrence are not yet
-established; PR3 must reuse wrapper \texttt{Vec}s and the \texttt{KSP}.
+cost (3.2~ns per unknown) traced from the PETSc source to
+\texttt{PCJACOBI}'s lazily built, host-checked diagonal (not yet confirmed by
+an experiment); PR3 must create the \texttt{KSP}/\texttt{PC} once and reuse it.
 Remaining before this PR can be marked \texttt{verified} in the
 status-tracking table: the independent-reviewer-agent pass
 (Section~\ref{sec:gates}) has not yet been run on this diff.}
