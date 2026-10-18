@@ -21,7 +21,8 @@
 // PETSc cannot apply to a shell Mat, so iteration counts are not expected to match.
 // The smoother changes the preconditioner only, not the system being solved.
 //
-// DISABLED_CudaTimingSweep runs the same solve with CUDA Vecs/tensors (shell
+// DISABLED_CudaTimingSweep runs the same solve, with and without MAT_SPD set on the
+// level Mats, with CUDA Vecs/tensors (shell
 // callbacks reach the device pointer through VecGet*ArrayAndMemType and run on
 // PETSc's stream) and prints KSPSetUp, first and repeat solve times and the cost
 // of one PCApply (= one V-cycle, comparable to TorchMultigridSpikeTest's
@@ -290,7 +291,7 @@ timedMs(bool cuda, const std::string & label, F fn)
 }
 
 PetscMGResult
-solvePetscMG(int64_t n, bool cuda = false, bool time_it = false)
+solvePetscMG(int64_t n, bool cuda = false, bool time_it = false, bool mark_spd = false)
 {
   const auto device = cuda ? torch::Device(torch::kCUDA, 0) : torch::Device(torch::kCPU);
   const auto dopts = torch::TensorOptions().dtype(torch::kDouble).device(device);
@@ -314,6 +315,13 @@ solvePetscMG(int64_t n, bool cuda = false, bool time_it = false)
     PetscCallAbort(PETSC_COMM_SELF,
                    MatShellSetOperation(A[l], MATOP_GET_DIAGONAL, (void (*)(void))levelDiagonal));
   }
+  // Optionally assert what is true of this operator (-Laplacian + sigma, sigma > 0):
+  // every level is SPD. PETSc then skips PCJACOBI's host zero-diagonal check
+  // (jacobi.c) and estimates Chebyshev bounds with CG instead of GMRES (cheby.c).
+  // It does not change the system or its solution.
+  if (mark_spd)
+    for (auto & m : A)
+      PetscCallAbort(PETSC_COMM_SELF, MatSetOption(m, MAT_SPD, PETSC_TRUE));
 
   KSP ksp;
   PetscCallAbort(PETSC_COMM_SELF, KSPCreate(PETSC_COMM_SELF, &ksp));
@@ -478,6 +486,27 @@ TEST(PetscTorchMultigridTest, TimedPathMatchesPlainPath)
   EXPECT_EQ(plain.its, timed.its);
   EXPECT_LT(timed.relative_error, 1e-8);
   EXPECT_GT(timed.vcycle_ms, 0.0);
+}
+
+// Marking the levels SPD changes only how PETSc sets up (Chebyshev eigenvalue
+// estimator, Jacobi diagonal check), so the solve must still converge accurately in
+// a similar number of iterations (the CG and GMRES eigenvalue estimates differ, so
+// the counts need not be identical).
+TEST(PetscTorchMultigridTest, MarkingLevelsSpdKeepsTheSolution)
+{
+  for (const int64_t n : {64, 256})
+  {
+    const auto plain = solvePetscMG(n);
+    const auto spd = solvePetscMG(n, /*cuda=*/false, /*time_it=*/false, /*mark_spd=*/true);
+    printf("n=%ld PCMG its: unmarked %d, MAT_SPD %d | relative error %.2e, %.2e\n",
+           long(n),
+           int(plain.its),
+           int(spd.its),
+           plain.relative_error,
+           spd.relative_error);
+    EXPECT_LT(spd.relative_error, 1e-8);
+    EXPECT_LE(spd.its, plain.its + 2);
+  }
 }
 
 // PICARD SWEEP: variable-coefficient problem and preconditioner-update policies.
@@ -985,18 +1014,22 @@ TEST(PetscTorchMultigridTest, DISABLED_CudaTimingSweep)
   ASSERT_TRUE(torch::cuda::is_available()) << "needs a CUDA-enabled libtorch and a GPU";
   for (const int64_t n : {256, 512, 1024, 2048, 4096, 8192})
   {
-    const auto r = solvePetscMG(n, /*cuda=*/true, /*time_it=*/true);
-    EXPECT_LT(r.relative_error, 1e-8);
-    printf("n=%ld PETSc KSPCG+PCMG CUDA: setup %.3f ms, %d its, solve %.1f ms, repeat %.1f ms "
-           "(%.3f ms/it) | PCApply (V-cycle) %.3f ms | relative error %.2e\n",
-           long(n),
-           r.setup_ms,
-           int(r.its),
-           r.first_ms,
-           r.repeat_ms,
-           r.repeat_ms / r.its,
-           r.vcycle_ms,
-           r.relative_error);
+    for (const bool spd : {false, true})
+    {
+      const auto r = solvePetscMG(n, /*cuda=*/true, /*time_it=*/true, spd);
+      EXPECT_LT(r.relative_error, 1e-8);
+      printf("n=%ld %s PETSc KSPCG+PCMG CUDA: setup %.3f ms, %d its, solve %.1f ms, repeat %.1f ms "
+             "(%.3f ms/it) | PCApply (V-cycle) %.3f ms | relative error %.2e\n",
+             long(n),
+             spd ? "MAT_SPD " : "unmarked",
+             r.setup_ms,
+             int(r.its),
+             r.first_ms,
+             r.repeat_ms,
+             r.repeat_ms / r.its,
+             r.vcycle_ms,
+             r.relative_error);
+    }
   }
 }
 #endif
