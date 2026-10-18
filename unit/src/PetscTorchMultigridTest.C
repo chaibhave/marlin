@@ -20,14 +20,46 @@
 // preconditioned by PCJACOBI. The torch spike uses red-black Gauss-Seidel, which
 // PETSc cannot apply to a shell Mat, so iteration counts are not expected to match.
 // The smoother changes the preconditioner only, not the system being solved.
+//
+// DISABLED_CudaTimingSweep runs the same solve with CUDA Vecs/tensors (shell
+// callbacks reach the device pointer through VecGet*ArrayAndMemType and run on
+// PETSc's stream) and prints KSPSetUp, first and repeat solve times and the cost
+// of one PCApply (= one V-cycle, comparable to TorchMultigridSpikeTest's
+// DISABLED_CudaVcycleTimingSweep). Run on a GPU machine with
+//   --gtest_also_run_disabled_tests
+//   --gtest_filter='*PetscTorchMultigridTest.DISABLED_CudaTimingSweep'
+// The CUDA path is compiled only when PETSc and libtorch both have CUDA; it has
+// not been compiled or run where this was written.
 
 #include "MarlinUtils.h"
 #include "gtest/gtest.h"
 
 #include <petscksp.h>
 
+#include <torch/cuda.h>
+
+#include <chrono>
 #include <memory>
+#include <string>
 #include <vector>
+
+#if defined(__has_include)
+#if __has_include(<ATen/cuda/CUDAConfig.h>)
+#define MARLIN_PCMG_TORCH_CUDA 1
+#endif
+#endif
+#if PetscDefined(HAVE_CUDA) && defined(MARLIN_PCMG_TORCH_CUDA)
+#define MARLIN_PCMG_CUDA_LEG 1
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <petscdevice_cuda.h>
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define MARLIN_PCMG_NVTX 1
+#endif
+#else
+#define MARLIN_PCMG_CUDA_LEG 0
+#endif
 
 namespace
 {
@@ -43,19 +75,51 @@ struct LevelContext
   double h2;
 };
 
-/// Views x as an [nx, nx] grid, y as an [ny, ny] grid, and sets y = f(x).
+#if MARLIN_PCMG_CUDA_LEG
+/// Makes torch enqueue on PETSc's current CUDA stream while a shell callback runs,
+/// so the stencil kernels are ordered with PETSc's own vector kernels.
+class PetscStreamGuard
+{
+public:
+  PetscStreamGuard()
+  {
+    cudaStream_t petsc_stream;
+    PetscCallAbort(PETSC_COMM_SELF, PetscGetCurrentCUDAStream(&petsc_stream));
+    _guard = std::make_unique<c10::cuda::CUDAStreamGuard>(
+        c10::cuda::getStreamFromExternal(petsc_stream, c10::cuda::current_device()));
+  }
+
+private:
+  std::unique_ptr<c10::cuda::CUDAStreamGuard> _guard;
+};
+#endif
+
+/// Views x as an [nx, nx] grid, y as an [ny, ny] grid, and sets y = f(x), on the
+/// device the Vec's memory lives on (host Vec -> CPU tensors, CUDA Vec -> the
+/// device pointer, never a host round trip).
 template <typename F>
 PetscErrorCode
 applyOnGrids(Vec x, Vec y, int64_t nx, int64_t ny, F f)
 {
   const PetscScalar * x_array;
   PetscScalar * y_array;
-  PetscCall(VecGetArrayRead(x, &x_array));
-  PetscCall(VecGetArray(y, &y_array));
-  const auto in = torch::from_blob(const_cast<PetscScalar *>(x_array), {nx, nx}, torch::kDouble);
-  torch::from_blob(y_array, {ny, ny}, torch::kDouble).copy_(f(in));
-  PetscCall(VecRestoreArrayRead(x, &x_array));
-  PetscCall(VecRestoreArray(y, &y_array));
+  PetscMemType memtype;
+  PetscCall(VecGetArrayReadAndMemType(x, &x_array, &memtype));
+  PetscCall(VecGetArrayWriteAndMemType(y, &y_array, nullptr));
+  auto options = torch::TensorOptions().dtype(torch::kDouble);
+#if MARLIN_PCMG_CUDA_LEG
+  std::unique_ptr<PetscStreamGuard> guard;
+  if (PetscMemTypeDevice(memtype))
+  {
+    options = options.device(torch::kCUDA, c10::cuda::current_device());
+    guard = std::make_unique<PetscStreamGuard>();
+  }
+#endif
+  (void)memtype;
+  const auto in = torch::from_blob(const_cast<PetscScalar *>(x_array), {nx, nx}, options);
+  torch::from_blob(y_array, {ny, ny}, options).copy_(f(in));
+  PetscCall(VecRestoreArrayReadAndMemType(x, &x_array));
+  PetscCall(VecRestoreArrayWriteAndMemType(y, &y_array));
   return PETSC_SUCCESS;
 }
 
@@ -134,17 +198,28 @@ restrictMult(Mat R, Vec fine, Vec coarse)
 }
 
 Mat
-makeShell(int64_t rows, int64_t cols, LevelContext * ctx, PetscErrorCode (*mult)(Mat, Vec, Vec))
+makeShell(int64_t rows,
+          int64_t cols,
+          LevelContext * ctx,
+          PetscErrorCode (*mult)(Mat, Vec, Vec),
+          bool cuda)
 {
   Mat m;
   PetscCallAbort(PETSC_COMM_SELF, MatCreateShell(PETSC_COMM_SELF, rows, cols, rows, cols, ctx, &m));
   PetscCallAbort(PETSC_COMM_SELF, MatShellSetOperation(m, MATOP_MULT, (void (*)(void))mult));
+#if MARLIN_PCMG_CUDA_LEG
+  // Vecs that PCMG and the level KSPs create from this Mat live on the device.
+  if (cuda)
+    PetscCallAbort(PETSC_COMM_SELF, MatShellSetVecType(m, VECSEQCUDA));
+#else
+  (void)cuda;
+#endif
   return m;
 }
 
 /// Dense coarsest operator, columns = stencil applied to unit vectors.
 Mat
-makeCoarseDense(int64_t n, double h2)
+makeCoarseDense(int64_t n, double h2, bool cuda)
 {
   const int64_t m = n * n;
   auto columns = torch::zeros({m, m}, torch::kDouble);
@@ -162,6 +237,12 @@ makeCoarseDense(int64_t n, double h2)
   PetscCallAbort(PETSC_COMM_SELF, MatDenseGetArray(A, &array));
   std::copy_n(storage.data_ptr<double>(), m * m, array);
   PetscCallAbort(PETSC_COMM_SELF, MatDenseRestoreArray(A, &array));
+#if MARLIN_PCMG_CUDA_LEG
+  if (cuda)
+    PetscCallAbort(PETSC_COMM_SELF, MatConvert(A, MATSEQDENSECUDA, MAT_INPLACE_MATRIX, &A));
+#else
+  (void)cuda;
+#endif
   return A;
 }
 
@@ -169,11 +250,52 @@ struct PetscMGResult
 {
   PetscInt its;
   double relative_error;
+  // Filled only when timing was requested (ms).
+  double setup_ms = 0, first_ms = 0, repeat_ms = 0, vcycle_ms = 0;
 };
 
-PetscMGResult
-solvePetscMG(int64_t n)
+/// Scoped NVTX range (no-op without the NVTX headers or without the CUDA leg).
+class Range
 {
+public:
+  explicit Range(const std::string & name)
+  {
+#ifdef MARLIN_PCMG_NVTX
+    nvtxRangePushA(name.c_str());
+#else
+    (void)name;
+#endif
+  }
+  ~Range()
+  {
+#ifdef MARLIN_PCMG_NVTX
+    nvtxRangePop();
+#endif
+  }
+};
+
+/// Wall time of fn() in ms, device-synchronized on both sides when on CUDA.
+template <typename F>
+double
+timedMs(bool cuda, const std::string & label, F fn)
+{
+  if (cuda)
+    torch::cuda::synchronize();
+  Range range(label);
+  const auto t0 = std::chrono::steady_clock::now();
+  fn();
+  if (cuda)
+    torch::cuda::synchronize();
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+PetscMGResult
+solvePetscMG(int64_t n, bool cuda = false, bool time_it = false)
+{
+  const auto device = cuda ? torch::Device(torch::kCUDA, 0) : torch::Device(torch::kCPU);
+  const auto dopts = torch::TensorOptions().dtype(torch::kDouble).device(device);
+  const std::string tag = " n=" + std::to_string(n);
+
   // Levels ordered coarse (0) to fine (L-1), PCMG's convention.
   std::vector<int64_t> sizes;
   for (int64_t s = n; s >= coarsest_n; s /= 2)
@@ -185,10 +307,10 @@ solvePetscMG(int64_t n)
     contexts.push_back(std::make_unique<LevelContext>(LevelContext{s, 1.0 / (double(s) * s)}));
 
   std::vector<Mat> A(L);
-  A[0] = makeCoarseDense(sizes[0], contexts[0]->h2);
+  A[0] = makeCoarseDense(sizes[0], contexts[0]->h2, cuda);
   for (PetscInt l = 1; l < L; ++l)
   {
-    A[l] = makeShell(sizes[l] * sizes[l], sizes[l] * sizes[l], contexts[l].get(), levelMult);
+    A[l] = makeShell(sizes[l] * sizes[l], sizes[l] * sizes[l], contexts[l].get(), levelMult, cuda);
     PetscCallAbort(PETSC_COMM_SELF,
                    MatShellSetOperation(A[l], MATOP_GET_DIAGONAL, (void (*)(void))levelDiagonal));
   }
@@ -211,8 +333,8 @@ solvePetscMG(int64_t n)
   for (PetscInt l = 1; l < L; ++l)
   {
     const int64_t nf = sizes[l], nc = sizes[l - 1];
-    Mat P = makeShell(nf * nf, nc * nc, contexts[l].get(), prolongMult);
-    Mat R = makeShell(nc * nc, nf * nf, contexts[l].get(), restrictMult);
+    Mat P = makeShell(nf * nf, nc * nc, contexts[l].get(), prolongMult, cuda);
+    Mat R = makeShell(nc * nc, nf * nf, contexts[l].get(), restrictMult, cuda);
     PetscCallAbort(PETSC_COMM_SELF, PCMGSetInterpolation(pc, l, P));
     PetscCallAbort(PETSC_COMM_SELF, PCMGSetRestriction(pc, l, R));
     transfers.push_back(P);
@@ -243,7 +365,7 @@ solvePetscMG(int64_t n)
   }
 
   // Manufactured smooth solution, same as the torch MPI spike (single rank).
-  const auto xs = (torch::arange(n, torch::kDouble) + 0.5) / n;
+  const auto xs = (torch::arange(n, dopts) + 0.5) / n;
   const double two_pi = 2.0 * M_PI;
   const auto x_exact =
       (torch::sin(two_pi * xs).unsqueeze(1) * torch::cos(2.0 * two_pi * xs).unsqueeze(0) +
@@ -251,15 +373,63 @@ solvePetscMG(int64_t n)
        0.25 * torch::sin(two_pi * xs).unsqueeze(0))
           .contiguous();
   auto b = stencil(x_exact, contexts[L - 1]->h2).contiguous();
-  auto x = torch::zeros({n, n}, torch::kDouble);
+  auto x = torch::zeros({n, n}, dopts);
+  auto y = torch::zeros({n, n}, dopts); // PCApply output for the V-cycle timing
 
-  Vec b_vec, x_vec;
-  PetscCallAbort(PETSC_COMM_SELF,
-                 VecCreateSeqWithArray(PETSC_COMM_SELF, 1, n * n, b.data_ptr<double>(), &b_vec));
-  PetscCallAbort(PETSC_COMM_SELF,
-                 VecCreateSeqWithArray(PETSC_COMM_SELF, 1, n * n, x.data_ptr<double>(), &x_vec));
+  // Zero-copy Vecs over the tensors (host or CUDA memory).
+  auto wrap = [&](torch::Tensor & t)
+  {
+    Vec v;
+#if MARLIN_PCMG_CUDA_LEG
+    if (cuda)
+    {
+      PetscCallAbort(
+          PETSC_COMM_SELF,
+          VecCreateSeqCUDAWithArray(PETSC_COMM_SELF, 1, n * n, t.data_ptr<double>(), &v));
+      return v;
+    }
+#endif
+    PetscCallAbort(PETSC_COMM_SELF,
+                   VecCreateSeqWithArray(PETSC_COMM_SELF, 1, n * n, t.data_ptr<double>(), &v));
+    return v;
+  };
+  Vec b_vec = wrap(b), x_vec = wrap(x), y_vec = wrap(y);
 
-  PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
+  PetscMGResult timings{};
+  if (time_it)
+  {
+    timings.setup_ms = timedMs(
+        cuda, "PCMG KSPSetUp" + tag, [&] { PetscCallAbort(PETSC_COMM_SELF, KSPSetUp(ksp)); });
+    timings.first_ms =
+        timedMs(cuda,
+                "KSPCG+PCMG first" + tag,
+                [&] { PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec)); });
+    PetscInt first_its;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetIterationNumber(ksp, &first_its));
+    x.zero_();
+    timings.repeat_ms =
+        timedMs(cuda,
+                "KSPCG+PCMG repeat" + tag,
+                [&] { PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec)); });
+    PetscInt repeat_its;
+    PetscCallAbort(PETSC_COMM_SELF, KSPGetIterationNumber(ksp, &repeat_its));
+    EXPECT_EQ(first_its, repeat_its);
+
+    // One PCApply = one V-cycle from a zero guess.
+    constexpr int reps = 20;
+    PetscCallAbort(PETSC_COMM_SELF, PCApply(pc, b_vec, y_vec)); // warm-up
+    timings.vcycle_ms = timedMs(cuda,
+                                "PCMG PCApply x20" + tag,
+                                [&]
+                                {
+                                  for (int i = 0; i < reps; ++i)
+                                    PetscCallAbort(PETSC_COMM_SELF, PCApply(pc, b_vec, y_vec));
+                                }) /
+                        reps;
+    // Leave x holding the repeat solution for the error check below.
+  }
+  else
+    PetscCallAbort(PETSC_COMM_SELF, KSPSolve(ksp, b_vec, x_vec));
 
   KSPConvergedReason reason;
   PetscInt its;
@@ -271,12 +441,15 @@ solvePetscMG(int64_t n)
 
   PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&b_vec));
   PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&x_vec));
+  PetscCallAbort(PETSC_COMM_SELF, VecDestroy(&y_vec));
   PetscCallAbort(PETSC_COMM_SELF, KSPDestroy(&ksp));
   for (auto & m : A)
     PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&m));
   for (auto & m : transfers)
     PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&m));
-  return {its, relative_error};
+  timings.its = its;
+  timings.relative_error = relative_error;
+  return timings;
 }
 } // namespace
 
@@ -295,3 +468,39 @@ TEST(PetscTorchMultigridTest, KspCgWithPcmgSolvesAndIsGridIndependent)
   }
   EXPECT_LE(its.back(), its.front() + 2);
 }
+
+// The timing path (explicit KSPSetUp, first and repeat solve, PCApply) must give
+// the same solution quality as the plain path; this is what the CUDA sweep runs.
+TEST(PetscTorchMultigridTest, TimedPathMatchesPlainPath)
+{
+  const auto plain = solvePetscMG(128);
+  const auto timed = solvePetscMG(128, /*cuda=*/false, /*time_it=*/true);
+  EXPECT_EQ(plain.its, timed.its);
+  EXPECT_LT(timed.relative_error, 1e-8);
+  EXPECT_GT(timed.vcycle_ms, 0.0);
+}
+
+#if MARLIN_PCMG_CUDA_LEG
+// Timing only; correctness is asserted through the relative error. n = 256..8192
+// matches the torch V-cycle sweep. Per size: KSPSetUp, first and repeat solve,
+// iteration count, and the cost of one V-cycle (PCApply).
+TEST(PetscTorchMultigridTest, DISABLED_CudaTimingSweep)
+{
+  ASSERT_TRUE(torch::cuda::is_available()) << "needs a CUDA-enabled libtorch and a GPU";
+  for (const int64_t n : {256, 512, 1024, 2048, 4096, 8192})
+  {
+    const auto r = solvePetscMG(n, /*cuda=*/true, /*time_it=*/true);
+    EXPECT_LT(r.relative_error, 1e-8);
+    printf("n=%ld PETSc KSPCG+PCMG CUDA: setup %.3f ms, %d its, solve %.1f ms, repeat %.1f ms "
+           "(%.3f ms/it) | PCApply (V-cycle) %.3f ms | relative error %.2e\n",
+           long(n),
+           r.setup_ms,
+           int(r.its),
+           r.first_ms,
+           r.repeat_ms,
+           r.repeat_ms / r.its,
+           r.vcycle_ms,
+           r.relative_error);
+  }
+}
+#endif
