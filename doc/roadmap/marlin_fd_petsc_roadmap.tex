@@ -1157,7 +1157,7 @@ the rank count (np $=1/2/4/8$). Dropping one halo update must break
 convergence.
 
 \textbf{Retires:} R8 (2D periodic; non-periodic axes still open). \status{spike done
-(\texttt{46ecff3}, \texttt{cd56180}, \texttt{6f9b8ee}, \texttt{99bc4ec}). Own MPI halo
+(\texttt{46ecff3}, \texttt{cd56180}, \texttt{6f9b8ee}, \texttt{99bc4ec}, \texttt{b3dcd72}). Own MPI halo
 exchange in each shell callback, assembled MPIAIJ coarsest level solved by
 \texttt{PCREDUNDANT}, and halving while every owned extent stays even.
 On CPU at np $=1/2/4/8$: 9 iterations at $n=64/128/256$, and at $n=96$
@@ -1183,10 +1183,28 @@ partition (explicit \texttt{lx}/\texttt{ly}, axes swapped so DMDA's x-fastest
 order is torch's row-major $[m_x, m_y]$, ranks renumbered to match; ownership
 checked against Marlin). Ghosts are filled by \texttt{DMGlobalToLocal} on Vecs
 placed onto the tensors' storage. Solutions and iteration counts are
-bitwise identical to our own exchange at np $=1/2/4/8$. Both work; the DMDA
-version is about the same amount of code once the axis swap is in place and
-would bring non-periodic \texttt{DM\_BOUNDARY\_GHOSTED} and the telescope DMDA mode (both untested).
-Choosing one is a PR3 decision; timings were not measured.
+bitwise identical to our own exchange at np $=1/2/4/8$. For the halo alone the
+two are equivalent; neither fills non-periodic boundary ghosts
+(\texttt{DM\_BOUNDARY\_GHOSTED} leaves them to Marlin's
+\texttt{TensorBoundaryCondition}, as \texttt{exchangeGhostLayers} does). The DMDA's
+value is the hierarchy below. Timings were not measured.
+\item \textbf{PETSc-owned hierarchy} (\texttt{b3dcd72}). Only the fine level is a
+torch shell. The coarse DMDAs and their partitions come from \texttt{DMCoarsen},
+the coarse levels are rediscretised and assembled with
+\texttt{MatSetValuesStencil} (scaled by $4^k$ because PCMG restricts with
+$P^T$; a preconditioner-level convention), and the transfers come from the DM or
+are assembled from our stencil. The depth no longer depends on the rank grid:
+$n=112$ on $2\times4$ keeps 4 levels (coarse $n=14$), 9 iterations. Iterations at
+np $=1/2/4/8$, $n=64/96/112/256$:
+cell-centred bilinear (our stencil, assembled) 9 at every case, equal to the
+single-rank torch-shell hierarchy; \texttt{DMDA\_Q1} 9--10; \texttt{DMDA\_Q0}
+17--19. The fully automatic path (\texttt{KSPSetDM} + \texttt{KSPSetComputeOperators},
+PCMG coarsens and builds Q1 itself) gives the same counts as the hand-built Q1
+hierarchy. PETSc's coarse partition is chosen for vertex-based transfers, so our
+cell-centred interpolation is assembled with global column indices (a needed
+coarse cell can lie outside the one-cell ghost frame). Which transfer to use is
+a user decision (Q1: no transfer code, $\le$1 extra iteration here; cell-centred:
+$\sim$60 lines, matches the discretisation).
 \item \textbf{3D, one rank.} 7-point operator, the same transfers applied axis
 by axis, assembled SeqAIJ coarse level: 8 iterations at $n=16/32/64$ with both
 \texttt{PCREDUNDANT} and telescope + LU, relative error $\le 8.7\times10^{-12}$.
@@ -1416,7 +1434,7 @@ PR1 & BC TensorComputes, ghost-fill & proposed & --- \\
 PR1a & Torch-native vs.\ PETSc matrix-free benchmark & CPU+CUDA verified, reviewed; not merged (tag \texttt{pr1b-spikes}) & CPU+CUDA logs and tables in Section~\ref{sec:roadmap} (PR1a) \\
 PR1b & Multigrid spikes $\to$ hybrid design & reviewed, findings addressed; not merged (tag \texttt{pr1b-spikes}) & chain table and logs (Section~\ref{sec:pr1b}) \\
 PR2 & DMDA/decomposition compatibility spike & spike implemented, unmerged & passes 1--8 ranks \\
-PR2b & Multi-rank PCMG on torch shells & spike done (\texttt{99bc4ec}) & own and DMDA halos identical np $=1$--8; telescope = redundant; 3D one rank 8 its \\
+PR2b & Multi-rank PCMG on torch shells & spike done (\texttt{b3dcd72}) & halos identical; telescope = redundant; 3D 8 its; PETSc-owned hierarchy rank-independent (Q1 9--10, cell-centred 9) \\
 PR2c & Non-SPD + torch PCSHELL smoother + fusion & proposed & --- \\
 PR3 & PetscFDSolverBase, single field, matrix-free & proposed & --- \\
 PR4 & BC terms in matrix-free operator application & proposed & --- \\
