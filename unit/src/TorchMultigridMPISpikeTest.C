@@ -16,9 +16,10 @@
 // named buffer and to the fine-level owned size in _domain.
 //
 // 2D periodic  A u = -Laplacian(u) + sigma u, h = 1/n, cell-centered, CPU.
-// Run:  mpiexec -n {1,2,4} ./marlin-unit-opt --gtest_filter='TorchMultigridMPISpikeTest.*'
-// and compare the printed iteration count and solution checksums across rank
-// counts. n and the rank grid must satisfy coarsest_n % parts == 0.
+// Run:  mpiexec -n {1,2,4,8} ./marlin-unit-opt --gtest_filter='TorchMultigridMPISpikeTest.*'
+// The test asserts the single-rank iteration count at every rank count; the printed
+// checksums can be compared by hand as well. n and the rank grid must satisfy coarsest_n % parts ==
+// 0.
 
 #include "ActionFactory.h"
 #include "AppFactory.h"
@@ -30,6 +31,7 @@
 
 #include <array>
 #include <cmath>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -206,7 +208,11 @@ public:
       _levels.push_back({level_n, mx, my, b0, b1, 1.0 / (double(level_n) * level_n)});
       if (level_n == coarsest_n)
         break;
-      if (mx % 2 || my % 2)
+      // Agree on the check across ranks, so a rank with an odd extent does not throw
+      // alone and leave the others waiting in the halo exchange.
+      int odd = (mx % 2 || my % 2) ? 1 : 0;
+      MPI_Allreduce(MPI_IN_PLACE, &odd, 1, MPI_INT, MPI_MAX, _L.comm);
+      if (odd)
         throw std::runtime_error("owned extent must stay even down to the coarsest level");
     }
 
@@ -354,6 +360,11 @@ TEST(TorchMultigridMPISpikeTest, SolvesAndIsRankCountIndependent)
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+  // Iteration counts on 1 rank (np=1, 2, 4, 8 all gave these on CPU, 2026-10-18).
+  // Asserting them exactly makes the rank-count independence a check rather than a
+  // comparison of printed output; one dropped ghost update gave 1024..16384.
+  const std::map<int64_t, unsigned int> single_rank_its = {{64, 10}, {128, 10}, {256, 10}};
+
   for (const int64_t n : {64, 128, 256})
   {
     auto md = buildDomain(n);
@@ -368,7 +379,7 @@ TEST(TorchMultigridMPISpikeTest, SolvesAndIsRankCountIndependent)
              result.error,
              result.sum,
              result.sumsq);
-    EXPECT_LE(result.its, 14u);
+    EXPECT_EQ(result.its, single_rank_its.at(n));
     EXPECT_LT(result.error, 1e-8);
   }
 }

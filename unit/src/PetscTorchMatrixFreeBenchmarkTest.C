@@ -249,6 +249,8 @@ buildShellKSP(const PeriodicStencilOperator & op, ShellContext & ctx, int64_t n)
   KSP ksp;
   PetscCallAbort(PETSC_COMM_SELF, KSPCreate(PETSC_COMM_SELF, &ksp));
   PetscCallAbort(PETSC_COMM_SELF, KSPSetOperators(ksp, mat, mat));
+  // The KSP holds its own reference; drop ours so KSPDestroy frees the shell.
+  PetscCallAbort(PETSC_COMM_SELF, MatDestroy(&mat));
   PetscCallAbort(PETSC_COMM_SELF, KSPSetType(ksp, KSPCG));
   PetscCallAbort(PETSC_COMM_SELF, KSPSetNormType(ksp, KSP_NORM_UNPRECONDITIONED));
   PetscCallAbort(PETSC_COMM_SELF, KSPSetTolerances(ksp, rel_tol, 0.0, PETSC_DEFAULT, n * n));
@@ -817,14 +819,9 @@ cudaShellMatMult(Mat mat, Vec x, Vec y)
 
   PetscStreamGuard stream_guard;
 
-  // VecCUDAGetArray/VecCUDARestoreArray hand back the device pointer with no
-  // implicit device<->host copy - unlike VecGetArray on a CUDA Vec, which
-  // would force one. x's device data is read, not modified, by the stencil
-  // action, but there is no VecCUDAGetArrayRead counterpart used here
-  // because PETSc's const-correctness for the read-only overload still
-  // requires the same device-resident buffer; VecCUDAGetArray is used
-  // symmetrically for both x and y for clarity, matching the CPU leg's
-  // VecGetArrayRead/VecGetArray split in spirit, not in the exact overload.
+  // VecCUDAGetArrayRead (x) and VecCUDAGetArrayWrite (y) hand back the device
+  // pointers with no implicit device<->host copy - unlike VecGetArray on a CUDA
+  // Vec, which would force one.
   const PetscScalar * x_arr;
   PetscScalar * y_arr;
   PetscCallAbort(PETSC_COMM_SELF, VecCUDAGetArrayRead(x, &x_arr));

@@ -16,10 +16,10 @@
 // cell-centered bilinear P and restriction R = P^T / 4, both MATSHELLs, exactly
 // as in the torch spike. The coarsest level (n = 8) is a dense Mat solved by LU.
 //
-// Smoother: PCMG's default for matrix-free levels, KSPCHEBYSHEV (2 iterations)
-// preconditioned by PCJACOBI. The torch spike uses red-black Gauss-Seidel, which
-// PETSc cannot apply to a shell Mat, so iteration counts are not expected to match.
-// The smoother changes the preconditioner only, not the system being solved.
+// Smoother: KSPCHEBYSHEV (2 iterations) preconditioned by PCJACOBI, set
+// explicitly (PCMG's default PC is SOR, which a shell Mat cannot apply). The torch spike uses
+// red-black Gauss-Seidel, which PETSc cannot apply to a shell Mat, so iteration counts are not
+// expected to match. The smoother changes the preconditioner only, not the system being solved.
 //
 // DISABLED_CudaTimingSweep runs the same solve, with and without MAT_SPD set on the
 // level Mats, with CUDA Vecs/tensors (shell
@@ -104,9 +104,13 @@ applyOnGrids(Vec x, Vec y, int64_t nx, int64_t ny, F f)
 {
   const PetscScalar * x_array;
   PetscScalar * y_array;
-  PetscMemType memtype;
+  PetscMemType memtype, y_memtype;
   PetscCall(VecGetArrayReadAndMemType(x, &x_array, &memtype));
-  PetscCall(VecGetArrayWriteAndMemType(y, &y_array, nullptr));
+  PetscCall(VecGetArrayWriteAndMemType(y, &y_array, &y_memtype));
+  PetscCheck(PetscMemTypeDevice(memtype) == PetscMemTypeDevice(y_memtype),
+             PETSC_COMM_SELF,
+             PETSC_ERR_ARG_INCOMP,
+             "x and y must live on the same device");
   auto options = torch::TensorOptions().dtype(torch::kDouble);
 #if MARLIN_PCMG_CUDA_LEG
   std::unique_ptr<PetscStreamGuard> guard;
@@ -199,11 +203,7 @@ restrictMult(Mat R, Vec fine, Vec coarse)
 }
 
 Mat
-makeShell(int64_t rows,
-          int64_t cols,
-          LevelContext * ctx,
-          PetscErrorCode (*mult)(Mat, Vec, Vec),
-          bool cuda)
+makeShell(int64_t rows, int64_t cols, void * ctx, PetscErrorCode (*mult)(Mat, Vec, Vec), bool cuda)
 {
   Mat m;
   PetscCallAbort(PETSC_COMM_SELF, MatCreateShell(PETSC_COMM_SELF, rows, cols, rows, cols, ctx, &m));
@@ -524,12 +524,15 @@ TEST(PetscTorchMultigridTest, MarkingLevelsSpdKeepsTheSolution)
 // unpreconditioned relative tolerance as the rest of this file.
 //
 // The shell MatMult always reads the CURRENT coefficients, so the operator is exact
-// in every policy; only the PCMG setup (Chebyshev bounds, Jacobi diagonals, coarse
-// LU) can be stale. Policies:
-//   Always    - update the preconditioner before every Picard step
-//   BumpOnly  - only bump the level Mats' state; PCApply's PCSetUp then rebuilds
-//               lazily inside the next KSPSolve (observed: diagonal callbacks every
-//               step), so this is a rebuild every step timed inside the solve
+// in every policy; only the PCMG setup (Chebyshev bounds, Jacobi diagonals) can be
+// stale. The coarse dense LU is refactored every step under every policy, because
+// setCoefficients() refills it and MatDenseRestoreArray bumps its state. Policies:
+//   Always    - full rebuild before every Picard step (KSPSetOperators on every level)
+//   BumpOnly  - only bump the level Mats' state. This is a PARTIAL rebuild, inside
+//               the next KSPSolve: PCSetUp_MG re-sets-up the finest smoother only, and
+//               the other levels' Chebyshev keeps its old eigenvalue bounds; the Jacobi
+//               diagonals are rebuilt lazily on every level (PETSc 3.25.4, mg.c/
+//               cheby.c). Bumping also clears MAT_SPD unless MAT_SPD_ETERNAL is set.
 //   Never     - set up once, before step 0
 //   Threshold - update when the last solve took more than baseline + extra_its
 //               iterations (baseline = iterations right after the last update)
@@ -659,7 +662,7 @@ wrapTensor(torch::Tensor & t, int64_t n, bool cuda)
 class PicardMG
 {
 public:
-  PicardMG(int64_t n, bool cuda, torch::Device device) : _device(device)
+  PicardMG(int64_t n, bool cuda, torch::Device device)
   {
     for (int64_t s = n; s >= coarsest_n; s /= 2)
       _sizes.insert(_sizes.begin(), s);
@@ -689,11 +692,8 @@ public:
     fillCoarseDense(_A[0], *_contexts[0]);
     for (PetscInt l = 1; l < L; ++l)
     {
-      _A[l] = makeShell(_sizes[l] * _sizes[l],
-                        _sizes[l] * _sizes[l],
-                        reinterpret_cast<LevelContext *>(_contexts[l].get()),
-                        varLevelMult,
-                        cuda);
+      _A[l] = makeShell(
+          _sizes[l] * _sizes[l], _sizes[l] * _sizes[l], _contexts[l].get(), varLevelMult, cuda);
       PetscCallAbort(
           PETSC_COMM_SELF,
           MatShellSetOperation(_A[l], MATOP_GET_DIAGONAL, (void (*)(void))varLevelDiagonal));
@@ -781,9 +781,10 @@ public:
     fillCoarseDense(_A[0], *_contexts[0]);
   }
 
-  /// Make PCMG rebuild its setup: bump the shell Mats' state (MatAssemblyBegin/End)
-  /// and, if `reattach`, also call KSPSetOperators on every level and KSPSetUp, so
-  /// the rebuild happens here rather than lazily inside the next KSPSolve.
+  /// Bump the shell Mats' state (MatAssemblyBegin/End); if `reattach`, also call
+  /// KSPSetOperators on every level so the next KSPSetUp rebuilds every level's
+  /// smoother here. Without `reattach` the KSPSetUp below is a no-op and the bump only
+  /// causes the partial lazy rebuild described at the policy list.
   void update(bool reattach)
   {
     for (size_t l = 1; l < _A.size(); ++l)
@@ -803,7 +804,6 @@ public:
   }
 
 private:
-  torch::Device _device;
   std::vector<int64_t> _sizes;
   std::vector<std::unique_ptr<VarLevelContext>> _contexts;
   std::vector<std::unique_ptr<LevelContext>> _transfer_contexts;
