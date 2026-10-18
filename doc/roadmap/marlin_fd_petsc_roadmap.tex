@@ -1282,26 +1282,31 @@ remainder is small relative to the implicit part.
 \textbf{CUDA sweep (H200, \texttt{DISABLED\_CudaSmootherFusionSweep}), ms per
 \texttt{PCApply} of the fine RBGS PCSHELL:}
 \begin{center}
-\begin{tabular}{rrrr}
+\begin{tabular}{rrrrr}
 \toprule
-$n$ & eager & traced (FuseGraph) & CUDA graph (eager captured) \\
+$n$ & eager & traced (FuseGraph) & CUDA graph (eager) & CUDA graph (traced) \\
 \midrule
-256 & 0.184 & 0.058 & 0.086 \\
-512 & 0.178 & 0.058 & 0.128 \\
-1024 & 0.345 & 0.142 & 0.285 \\
-2048 & 1.259 & 0.517 & 1.193 \\
-4096 & 4.487 & 1.859 & 4.464 \\
-8192 & 17.299 & 7.263 & 17.465 \\
+256 & 0.185 & 0.060 & 0.086 & 0.033 \\
+512 & 0.177 & 0.059 & 0.129 & 0.046 \\
+1024 & 0.346 & 0.143 & 0.284 & 0.131 \\
+2048 & 1.261 & 0.518 & 1.193 & 0.510 \\
+4096 & 4.489 & 1.859 & 4.465 & 1.901 \\
+8192 & 17.301 & 7.260 & 17.464 & 7.493 \\
 \bottomrule
 \end{tabular}
 \end{center}
+(Run at \texttt{65109ae}; the earlier three-mode runs agree within 2\%.)
 Tracing gives 2.4--3.2$\times$ at every size (fused kernels, less memory
-traffic); the CUDA graph only removes launch overhead (2.1$\times$ at $n=256$,
-none for $n\ge2048$). This answers R10: fusion is worth having on CUDA.
-All three modes match the CPU eager result to $\le5\times10^{-16}$ relative
+traffic); capturing eager in a CUDA graph only removes launch overhead
+(2.1$\times$ at $n=256$, none for $n\ge2048$). Capturing the traced smoother
+combines both: 1.8$\times$ over traced at $n=256$ (0.033~ms, 5.6$\times$ eager),
+1.3$\times$ at $n=512$, equal at $n=1024$--2048, and 2--3\% slower at $n\ge4096$
+(the copy into the captured input buffer). This answers R10: fusion is worth
+having on CUDA, and graph capture is worth adding on top only for small grids
+(coarse levels, small problems).
+All four modes match the CPU eager result to $\le5.2\times10^{-16}$ relative
 (the first run's check failed only because its input came from the CUDA random
-generator; fixed in \texttt{63f0df1}, rerun at \texttt{31a97ef} passes with
-timings within 2\% of the first run).}
+generator; fixed in \texttt{63f0df1}).}
 
 \pr{3}{\texttt{PetscFDSolverBase}, Single Field, Matrix-Free, No Picard, No Nonlinear Remainder}
 \textbf{Hybrid-design update (2026-10-18):}
@@ -1520,7 +1525,7 @@ PR1a & Torch-native vs.\ PETSc matrix-free benchmark & CPU+CUDA verified, review
 PR1b & Multigrid spikes $\to$ hybrid design & reviewed, findings addressed; not merged (tag \texttt{pr1b-spikes}) & chain table and logs (Section~\ref{sec:pr1b}) \\
 PR2 & DMDA/decomposition compatibility spike & spike implemented, unmerged & passes 1--8 ranks \\
 PR2b & Multi-rank PCMG on torch shells & spike done (\texttt{b3dcd72}) & PETSc-owned hierarchy + cell-centred transfer adopted (user, 2026-10-18) \\
-PR2c & Non-SPD + torch PCSHELL smoother + fusion & CPU spike done (\texttt{40f6977}) & GS robust for upwind; Cheby/Jacobi fails at Pe $=10$; central Pe $\ge1$ deferred; CUDA traced 2.4--3.2$\times$ eager, matches CPU to round-off \\
+PR2c & Non-SPD + torch PCSHELL smoother + fusion & done (\texttt{40f6977}, \texttt{65109ae}) & GS robust for upwind; Cheby/Jacobi fails at Pe $=10$; central Pe $\ge1$ deferred; CUDA traced 2.4--3.2$\times$ eager, +graph capture 1.8$\times$ more at $n=256$, none at $n\ge1024$ \\
 PR3 & PetscFDSolverBase, single field, matrix-free & proposed & --- \\
 PR4 & BC terms in matrix-free operator application & proposed & --- \\
 PR4a & AMG-preconditioned mixed mode (matrix-free Amat + assembled Pmat), contingent & proposed & --- \\
