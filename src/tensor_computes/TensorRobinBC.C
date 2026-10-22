@@ -8,6 +8,8 @@
 
 #include "TensorRobinBC.h"
 #include "DomainAction.h"
+#include "Function.h"
+#include "MarlinUtils.h"
 
 registerMooseObject("MarlinApp", TensorRobinBC);
 
@@ -18,6 +20,13 @@ TensorRobinBC::validParams()
   params.addParam<Real>("a", 1, "Robin coefficient on u (a*u + b*du/dn = c).");
   params.addParam<Real>("b", 0, "Robin coefficient on du/dn (a*u + b*du/dn = c).");
   params.addParam<Real>("c", 0, "Robin right-hand-side value (a*u + b*du/dn = c).");
+  params.addParam<FunctionName>(
+      "c_function",
+      "Function giving c along the face, evaluated at the face position at the solve time.");
+  params.addParam<TensorInputBufferName>(
+      "c_buffer",
+      "Buffer whose first owned cell layer next to the face holds c along the face. The compute "
+      "that writes it must evaluate c at the face position, not at the cell centres.");
   params.addClassDescription(
       "General Robin boundary condition a*u + b*du/dn = c on a non-periodic domain face.");
   return params;
@@ -25,10 +34,25 @@ TensorRobinBC::validParams()
 
 TensorRobinBC::TensorRobinBC(const InputParameters & parameters)
   : TensorBoundaryCondition(parameters),
+    FunctionInterface(this),
     _a(getParam<Real>("a")),
     _b(getParam<Real>("b")),
-    _c(getParam<Real>("c"))
+    _c(getParam<Real>("c")),
+    _c_scalar(torch::tensor(_c, MooseTensor::floatTensorOptions())),
+    _c_function(isParamValid("c_function") ? &getFunction("c_function") : nullptr),
+    _c_buffer(isParamValid("c_buffer") ? &getInputBuffer("c_buffer") : nullptr),
+    _c_function_time(std::numeric_limits<Real>::quiet_NaN())
 {
+  if (unsigned(isParamSetByUser("c")) + bool(_c_function) + bool(_c_buffer) > 1)
+    paramError("c",
+               "Give only one of ",
+               parameters.checkForRename("c"),
+               ", ",
+               parameters.checkForRename("c_function"),
+               " and ",
+               parameters.checkForRename("c_buffer"),
+               ".");
+
   // the ghost value divides by a/2 + b/dx (see ghostCoefficientOnU0); this also rejects a = b = 0
   const auto dx = _domain.getGridSpacing()(faceDim());
   if (std::abs(_a / 2.0 + _b / dx) <= 1e-12 * (std::abs(_a) / 2.0 + std::abs(_b) / dx))
@@ -58,7 +82,7 @@ TensorRobinBC::fillGhostCellsStatic(torch::Tensor & buffer,
                                     int64_t owned_extent,
                                     Real a,
                                     Real b,
-                                    Real c,
+                                    const torch::Tensor & c,
                                     Real dx)
 {
   if (ghost_layers > 2)
@@ -83,7 +107,8 @@ TensorRobinBC::fillGhostCellsStatic(torch::Tensor & buffer,
                                 : buffer.narrow(face_dim, halo, 1);
 
   const auto coeff = ghostCoefficientOnU0(a, b, dx);
-  const auto rhs = ghostConstantTerm(a, b, c, dx);
+  // c / (a/2 + b/dx), see ghostConstantTerm
+  const auto rhs = c * ghostConstantTerm(a, b, 1.0, dx);
 
   // first ghost row, directly from the Robin relation at the face
   auto ghost1 = is_upper_face ? buffer.narrow(face_dim, halo + owned_extent, 1)
@@ -99,7 +124,8 @@ TensorRobinBC::fillGhostCellsStatic(torch::Tensor & buffer,
                                   : buffer.narrow(face_dim, halo + 1, 1);
     auto ghost2 = is_upper_face ? buffer.narrow(face_dim, halo + owned_extent + 1, 1)
                                 : buffer.narrow(face_dim, halo - 2, 1);
-    ghost2.copy_(ghostCoefficientOnU0(a, b, 3.0 * dx) * u1 + ghostConstantTerm(a, b, c, 3.0 * dx));
+    ghost2.copy_(ghostCoefficientOnU0(a, b, 3.0 * dx) * u1 +
+                 c * ghostConstantTerm(a, b, 1.0, 3.0 * dx));
   }
 }
 
@@ -136,14 +162,86 @@ TensorRobinBC::fillGhostCells(torch::Tensor & buffer,
                        owned_extent,
                        _a,
                        _b,
-                       _c,
+                       faceValue(),
                        dx);
+}
+
+void
+TensorRobinBC::prepareFaceData()
+{
+  if (_c_buffer)
+    _tensor_problem.exchangeFaceDataGhosts(getParam<TensorInputBufferName>("c_buffer"), faceDim());
+}
+
+torch::Tensor
+TensorRobinBC::faceValue() const
+{
+  if (_c_buffer)
+  {
+    // the first owned layer next to the face, over the whole padded extent of the other axes
+    // (its halo is filled by prepareFaceData)
+    const auto halo = int64_t(_tensor_problem.getMaxGhostLayer());
+    const auto d = faceDim();
+    return _c_buffer->narrow(d, isUpperFace() ? halo + _domain.getLocalGridSize()[d] - 1 : halo, 1);
+  }
+  if (_c_function)
+  {
+    const auto t = _tensor_problem.boundaryTime();
+    if (t != _c_function_time)
+    {
+      _c_function_face = functionFaceValue(t);
+      _c_function_time = t;
+    }
+    return _c_function_face;
+  }
+  return _c_scalar;
+}
+
+torch::Tensor
+TensorRobinBC::functionFaceValue(Real t) const
+{
+  // cell centres of the padded local grid along every axis; the face axis is set to the face
+  // position. Ghost positions along the other axes are true cell positions, so later axes'
+  // fills see the right c at the corners.
+  std::array<int64_t, 3> begin{{0, 0, 0}}, end{{0, 0, 0}};
+  _domain.getLocalBounds(_domain.comm().rank(), begin, end);
+  const auto & dx = _domain.getGridSpacing();
+  const auto & x0 = _domain.getDomainMin();
+  const auto halo = int64_t(_tensor_problem.getMaxGhostLayer());
+  const auto shape = _tensor_problem.getLocalTensorShape({});
+  const auto d = faceDim();
+
+  std::vector<int64_t> face_shape(shape.begin(), shape.end());
+  face_shape[d] = 1;
+  const auto position = [&](unsigned int axis, int64_t i)
+  {
+    if (axis == d)
+      return isUpperFace() ? _domain.getDomainMax()(d) : x0(d);
+    return x0(axis) + (begin[axis] + i - halo + 0.5) * dx(axis);
+  };
+
+  // row-major (last axis fastest), as the tensor below
+  face_shape.resize(3, 1);
+  std::vector<double> values;
+  values.reserve(face_shape[0] * face_shape[1] * face_shape[2]);
+  for (const auto i : make_range(face_shape[0]))
+    for (const auto j : make_range(face_shape[1]))
+      for (const auto k : make_range(face_shape[2]))
+        values.push_back(_c_function->value(t,
+                                            Point(position(0, i),
+                                                  _dim > 1 ? position(1, j) : 0.0,
+                                                  _dim > 2 ? position(2, k) : 0.0)));
+  face_shape.resize(_dim);
+  return torch::tensor(values, torch::TensorOptions().dtype(torch::kDouble))
+      .reshape(face_shape)
+      .to(MooseTensor::floatTensorOptions());
 }
 
 std::pair<std::vector<FDStencilEntry>, Real>
 TensorRobinBC::stencilContribution(unsigned int ghost_layers, Real dx) const
 {
-  // only the first ghost relation is reported; a second ghost layer is not represented
+  // only the first ghost relation is reported; a second ghost layer is not represented.
+  // The constant term is that of the scalar c (a face-varying c enters through fillGhostCells).
   if (ghost_layers != 1)
     mooseError("TensorRobinBC::stencilContribution supports one ghost layer only.");
 

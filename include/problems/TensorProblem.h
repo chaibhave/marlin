@@ -166,7 +166,21 @@ public:
 
   void runComputeWithGhosts(TensorOperatorBase & compute);
 
-  void exchangeGhostLayers(const std::string & buffer_name, unsigned int ghost_layers);
+  /// fill the ghost layers of buffer_name from the neighbouring ranks, periodic images and the
+  /// boundary conditions; with face_axis >= 0, see exchangeFaceDataGhosts
+  void exchangeGhostLayers(const std::string & buffer_name,
+                           unsigned int ghost_layers,
+                           int face_axis = -1);
+
+  /// fill the halo of face data (a boundary condition's c along a face normal to face_axis)
+  /// along the other axes: from the neighbouring ranks and periodic images, and with the
+  /// nearest owned value on a physical wall
+  void exchangeFaceDataGhosts(const std::string & buffer_name, unsigned int face_axis);
+
+  /// time at which boundary condition values are evaluated: the substep time, plus the offset
+  /// an implicit solver sets for the duration of its solve (the time level of the unknown)
+  Real boundaryTime() const { return _sub_time + _boundary_time_offset; }
+  void setBoundaryTimeOffset(Real offset) { _boundary_time_offset = offset; }
 
 protected:
   void updateDOFMap();
@@ -220,6 +234,9 @@ protected:
   Real _sub_dt;
   /// current substep time (the solver updates this). Computes should use this trather than the MOOSE _time!
   Real _sub_time;
+
+  /// see boundaryTime()
+  Real _boundary_time_offset = 0.0;
 
   /// simulation time for the currently running output thread
   Real _output_time;
