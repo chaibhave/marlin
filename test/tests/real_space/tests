@@ -76,6 +76,30 @@
     []
   []
 
+  [varying_bc]
+    issues = '#122'
+    design = 'TensorRobinBC.md TensorDirichletBC.md TensorNeumannBC.md'
+    requirement = 'The system shall apply real-space boundary condition values that vary along the face, given by a function or by a buffer, and reproduce the zero discrete Laplacian of a harmonic field that is linear normal to every face '
+    [double]
+      type = CSVDiff
+      input = bc_varying_laplacian.i
+      csvdiff = bc_varying_laplacian_out.csv
+      # the Laplacian is zero up to round-off of u / dx^2 (u <= 2, 1/dx^2 = 400)
+      abs_zero = 1e-9
+      compute_devices = 'cpu cuda xpu'
+      detail = 'in double precision, and'
+    []
+    [mps]
+      type = CSVDiff
+      input = bc_varying_laplacian.i
+      csvdiff = bc_varying_laplacian_out.csv
+      # single precision: round-off of u / dx^2 is ~ 2 * 6e-8 * 400 * a few terms
+      abs_zero = 1e-3
+      compute_devices = 'mps'
+      detail = 'in single precision on MPS.'
+    []
+  []
+
   [analytic_verification]
     issues = '#122'
     design = TensorDirichletBC.md
@@ -191,6 +215,21 @@
       cli_args = 'TensorComputes/BCs/extra/type=ConstantTensor TensorComputes/BCs/extra/buffer=extra'
       expect_err = "in \[TensorComputes/BCs\] is not a boundary condition"
       detail = 'when the object is not a boundary condition,'
+    []
+    [two_values]
+      type = RunException
+      input = bc_varying_laplacian.i
+      cli_args = 'TensorComputes/BCs/left/value=1'
+      expect_err = 'Give only one of value, value_function and value_buffer'
+      detail = 'when more than one value is given for it,'
+    []
+    [unwritten_value_buffer]
+      type = RunException
+      input = bc_varying_laplacian.i
+      cli_args = 'TensorComputes/BCs/right/value_buffer=nobody'
+      expect_err = "Buffer 'nobody', read by boundary condition 'right', is not written by any "
+                   "compute"
+      detail = 'when its value buffer is not written by any compute,'
     []
     [robin_zero_denominator]
       type = RunException

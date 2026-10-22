@@ -80,6 +80,10 @@ public:
   virtual std::pair<std::vector<FDStencilEntry>, Real>
   stencilContribution(unsigned int ghost_layers, Real dx) const = 0;
 
+  /// update data the ghost fill reads on the face (e.g. exchange a buffer's halo); called on
+  /// every rank before the variable's ghost exchange
+  virtual void prepareFaceData() {}
+
   /// Boundary conditions are not driven by the normal compute list.
   virtual void computeBuffer() override {}
 

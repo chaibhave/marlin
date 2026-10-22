@@ -632,6 +632,20 @@ TensorProblem::checkBoundaryConditions() const
                      TensorBoundaryCondition::faceName(face),
                      " face. Add one under [TensorComputes/BCs].");
 
+  // buffers a boundary condition reads (e.g. c_buffer) must be written by some compute
+  std::set<std::string> supplied;
+  for (const auto & list : {&_ics, &_computes})
+    for (const auto & cmp : *list)
+      supplied.insert(cmp->getSuppliedItems().begin(), cmp->getSuppliedItems().end());
+  for (const auto & [_, bc] : _bcs)
+    for (const auto & name : bc->getRequestedItems())
+      if (!supplied.count(name))
+        mooseError("Buffer '",
+                   name,
+                   "', read by boundary condition '",
+                   bc->name(),
+                   "', is not written by any compute or initial condition.");
+
   for (const auto & [key, bc] : _bcs)
     if (!_buffer_ghost_layers.count(key.first) || _buffer_ghost_layers.at(key.first) == 0)
       bc->paramError("variable",
@@ -657,7 +671,15 @@ TensorProblem::fillBoundaryGhosts(const std::string & buffer_name,
 }
 
 void
-TensorProblem::exchangeGhostLayers(const std::string & buffer_name, unsigned int ghost_layers)
+TensorProblem::exchangeFaceDataGhosts(const std::string & buffer_name, unsigned int face_axis)
+{
+  exchangeGhostLayers(buffer_name, _max_ghost_layers, face_axis);
+}
+
+void
+TensorProblem::exchangeGhostLayers(const std::string & buffer_name,
+                                   unsigned int ghost_layers,
+                                   int face_axis)
 {
   if (ghost_layers == 0)
     return;
@@ -671,6 +693,13 @@ TensorProblem::exchangeGhostLayers(const std::string & buffer_name, unsigned int
                ") exceed allocated halo width (",
                _max_ghost_layers,
                ").");
+
+  // the boundary conditions' face data first, on every rank (the exchange is collective, and
+  // only the ranks on a face fill its ghost cells below)
+  if (face_axis < 0)
+    for (const auto & [key, bc] : _bcs)
+      if (key.first == buffer_name)
+        bc->prepareFaceData();
 
   auto & base = getBufferBase(buffer_name);
   auto * tensor_buffer = dynamic_cast<TensorBuffer<torch::Tensor> *>(&base);
@@ -703,8 +732,22 @@ TensorProblem::exchangeGhostLayers(const std::string & buffer_name, unsigned int
 
   const int64_t halo = static_cast<int64_t>(_max_ghost_layers);
 
+  // ghost cells on a physical wall: from the boundary condition, or, for face data (a boundary
+  // condition's c_buffer), the nearest owned layer
+  const auto fill_wall = [&](unsigned int d, bool lower)
+  {
+    if (face_axis < 0)
+      fillBoundaryGhosts(buffer_name, tensor, d, lower, ghost_layers, halo, owned[d]);
+    else
+      tensor.narrow(d, lower ? halo - ghost_layers : halo + owned[d], ghost_layers)
+          .copy_(tensor.narrow(d, lower ? halo : halo + owned[d] - 1, 1));
+  };
+
   for (unsigned int d = 0; d < _dim; ++d)
   {
+    // face data is only read on the face, so its halo is needed along the other axes only
+    if (int(d) == face_axis)
+      continue;
     const unsigned int part = partitions[d];
     if (part == 1)
     {
@@ -721,8 +764,8 @@ TensorProblem::exchangeGhostLayers(const std::string & buffer_name, unsigned int
       }
       else
       {
-        fillBoundaryGhosts(buffer_name, tensor, d, /*lower=*/true, ghost_layers, halo, owned[d]);
-        fillBoundaryGhosts(buffer_name, tensor, d, /*lower=*/false, ghost_layers, halo, owned[d]);
+        fill_wall(d, /*lower=*/true);
+        fill_wall(d, /*lower=*/false);
       }
       continue;
     }
@@ -755,7 +798,7 @@ TensorProblem::exchangeGhostLayers(const std::string & buffer_name, unsigned int
           neighbor[d] = part - 1;
         else
         {
-          fillBoundaryGhosts(buffer_name, tensor, d, /*lower=*/true, ghost_layers, halo, owned[d]);
+          fill_wall(d, /*lower=*/true);
           return;
         }
       }
@@ -767,7 +810,7 @@ TensorProblem::exchangeGhostLayers(const std::string & buffer_name, unsigned int
           neighbor[d] = 0;
         else
         {
-          fillBoundaryGhosts(buffer_name, tensor, d, /*lower=*/false, ghost_layers, halo, owned[d]);
+          fill_wall(d, /*lower=*/false);
           return;
         }
       }

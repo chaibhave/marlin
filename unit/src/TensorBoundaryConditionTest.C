@@ -17,6 +17,12 @@
 // ghostConstantTerm() helpers, so a sign error in them is caught.
 namespace
 {
+torch::Tensor
+scalar(Real c)
+{
+  return torch::tensor(c, MooseTensor::floatTensorOptions());
+}
+
 // Checks fillGhostCellsStatic() and stencilContributionStatic() agree, and satisfy
 // the BC, for one Robin triple (a, b, c), on both the lower and upper face of a small
 // 1D interior field.
@@ -35,8 +41,16 @@ checkDualPath(Real a, Real b, Real c, Real dx)
     const auto u0 = is_upper_face ? u0_upper : u0_lower;
     buffer[is_upper_face ? halo + owned_extent - 1 : halo] = u0;
 
-    TensorRobinBC::fillGhostCellsStatic(
-        buffer, is_upper_face, /*face_dim=*/0, /*ghost_layers=*/1, halo, owned_extent, a, b, c, dx);
+    TensorRobinBC::fillGhostCellsStatic(buffer,
+                                        is_upper_face,
+                                        /*face_dim=*/0,
+                                        /*ghost_layers=*/1,
+                                        halo,
+                                        owned_extent,
+                                        a,
+                                        b,
+                                        scalar(c),
+                                        dx);
 
     const auto ghost_value = buffer[is_upper_face ? halo + owned_extent : halo - 1].item<double>();
 
@@ -79,8 +93,16 @@ checkSecondGhostLayer(Real a, Real b, Real c, Real dx)
     auto buffer = torch::zeros({owned_extent + 2 * halo}, MooseTensor::floatTensorOptions());
     buffer[is_upper_face ? halo + owned_extent - 2 : halo + 1] = u1;
 
-    TensorRobinBC::fillGhostCellsStatic(
-        buffer, is_upper_face, /*face_dim=*/0, /*ghost_layers=*/2, halo, owned_extent, a, b, c, dx);
+    TensorRobinBC::fillGhostCellsStatic(buffer,
+                                        is_upper_face,
+                                        /*face_dim=*/0,
+                                        /*ghost_layers=*/2,
+                                        halo,
+                                        owned_extent,
+                                        a,
+                                        b,
+                                        scalar(c),
+                                        dx);
 
     const auto ghost2 = buffer[is_upper_face ? halo + owned_extent + 1 : halo - 2].item<double>();
     const Real bc_residual = a * (u1 + ghost2) / 2.0 + b * (ghost2 - u1) / (3.0 * dx) - c;
@@ -126,7 +148,7 @@ TEST(TensorBoundaryConditionTest, MoreThanTwoGhostLayersIsAnError)
                                                    /*owned_extent=*/4,
                                                    1.0,
                                                    0.0,
-                                                   0.0,
+                                                   scalar(0.0),
                                                    0.1),
                std::exception);
 }
@@ -143,7 +165,34 @@ TEST(TensorBoundaryConditionTest, ZeroSecondLayerDenominatorIsAnError)
                                                    /*owned_extent=*/4,
                                                    -2.0 / 0.3,
                                                    1.0,
-                                                   0.0,
+                                                   scalar(0.0),
                                                    0.1),
                std::exception);
+}
+
+TEST(TensorBoundaryConditionTest, FaceVaryingValue)
+{
+  // a c that varies along a 2D face (axis 1) gives each ghost cell its own Robin relation
+  const int64_t halo = 2, owned_extent = 4, tangential = 5;
+  const Real a = 2.0, b = 3.0, dx = 0.05;
+  const Real tolerance =
+      MooseTensor::floatTensorOptions().dtype() == torch::kFloat64 ? 1e-12 : 1e-5;
+  const auto options = MooseTensor::floatTensorOptions();
+
+  for (const bool is_upper_face : {false, true})
+  {
+    auto buffer = torch::zeros({owned_extent + 2 * halo, tangential}, options);
+    const auto u0_index = is_upper_face ? halo + owned_extent - 1 : halo;
+    const auto u0 = torch::linspace(-1.0, 2.0, tangential, options);
+    buffer[u0_index] = u0;
+    const auto c = torch::linspace(0.5, -3.0, tangential, options).unsqueeze(0);
+
+    TensorRobinBC::fillGhostCellsStatic(
+        buffer, is_upper_face, /*face_dim=*/0, /*ghost_layers=*/1, halo, owned_extent, a, b, c, dx);
+
+    const auto ghost = buffer[is_upper_face ? halo + owned_extent : halo - 1];
+    const auto residual = a * (u0 + ghost) / 2.0 + b * (ghost - u0) / dx - c.squeeze(0);
+    EXPECT_LT(residual.abs().max().item<double>(), tolerance * (std::abs(a) / 2.0 + b / dx))
+        << "is_upper_face=" << is_upper_face;
+  }
 }
