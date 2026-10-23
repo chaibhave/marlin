@@ -182,7 +182,7 @@ public:
 
   /// fill the halo of face data (a boundary condition's c along a face normal to face_axis)
   /// along the other axes: from the neighbouring ranks and periodic images, and with the
-  /// nearest owned value on a physical wall
+  /// nearest owned value on a non-periodic boundary
   void exchangeFaceDataGhosts(const std::string & buffer_name, unsigned int face_axis);
 
   /// time at which boundary condition values are evaluated: the substep time, plus the offset

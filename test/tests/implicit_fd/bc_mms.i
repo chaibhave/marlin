@@ -1,4 +1,4 @@
-# Implicit solve of u_t - D Laplacian(u) = f on the unit square with walls, against the
+# Implicit solve of u_t - D Laplacian(u) = f on the unit square with boundary faces, against the
 # manufactured solution
 #
 #   u = g + tf t q,  g = cos(3 pi x / 2) cos(pi y) + x y,  q = x^2 - y^2,
