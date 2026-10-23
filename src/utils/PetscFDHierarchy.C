@@ -66,6 +66,116 @@ getInfo(DM da)
                                 &info.size[2]));
   return info;
 }
+
+/// periodic flag of each DMDA axis
+std::array<bool, 3>
+periodicAxes(DM da)
+{
+  std::array<DMBoundaryType, 3> bt;
+  PetscCallAbort(PetscObjectComm((PetscObject)da),
+                 DMDAGetInfo(da,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             &bt[0],
+                             &bt[1],
+                             &bt[2],
+                             nullptr));
+  return {{bt[0] == DM_BOUNDARY_PERIODIC,
+           bt[1] == DM_BOUNDARY_PERIODIC,
+           bt[2] == DM_BOUNDARY_PERIODIC}};
+}
+
+/**
+ * Fold the column index c (DMDA axis a, global extent M) back into the domain: unchanged
+ * inside, a ghost in layer l is its mirror (owned cell l from the face) times the face's
+ * factor at the spacing h (per Marlin axis, read only on an axis with faces). Returns the
+ * factor (1 inside or periodic).
+ */
+Real
+foldIndex(PetscInt & c,
+          PetscInt M,
+          bool periodic,
+          const FaceGhosts & faces,
+          unsigned int marlin_axis,
+          const std::vector<Real> & h)
+{
+  if (periodic || (c >= 0 && c < M))
+    return 1.0;
+  const bool upper = c >= M;
+  const auto layer = unsigned(upper ? c - M : -c - 1);
+  c = upper ? M - 1 - PetscInt(layer) : PetscInt(layer);
+  return faces.factor(2 * marlin_axis + upper, layer, h[marlin_axis]);
+}
+
+/// the stencil merged by offset, in DMDA axis order
+std::map<std::array<PetscInt, 3>, PetscScalar>
+mergedStencil(const std::vector<FDStencilEntry> & stencil, unsigned int dim, PetscReal scale)
+{
+  std::map<std::array<PetscInt, 3>, PetscScalar> merged;
+  for (const auto & entry : stencil)
+  {
+    std::array<PetscInt, 3> offset{{0, 0, 0}};
+    for (const auto a : make_range(dim))
+      offset[a] = entry.offset[marlinAxis(dim, a)];
+    merged[offset] += scale * entry.coefficient;
+  }
+  return merged;
+}
+
+/// Call row_fn(row, cols, values) for every owned row of the folded operator on da
+template <typename RowFn>
+void
+forEachFoldedRow(DM da,
+                 const std::vector<FDStencilEntry> & stencil,
+                 PetscReal scale,
+                 const FaceGhosts & faces,
+                 const std::vector<Real> & h,
+                 RowFn row_fn)
+{
+  const auto info = getInfo(da);
+  const auto dim = unsigned(info.dim);
+  const auto periodic = periodicAxes(da);
+  const auto merged = mergedStencil(stencil, dim, scale);
+
+  std::vector<MatStencil> cols;
+  std::vector<PetscScalar> values;
+  for (PetscInt k = info.start[2]; k < info.start[2] + info.size[2]; ++k)
+    for (PetscInt j = info.start[1]; j < info.start[1] + info.size[1]; ++j)
+      for (PetscInt i = info.start[0]; i < info.start[0] + info.size[0]; ++i)
+      {
+        MatStencil row{};
+        row.i = i, row.j = j, row.k = k;
+        cols.clear();
+        values.clear();
+        for (const auto & [offset, value] : merged)
+        {
+          std::array<PetscInt, 3> c{{i + offset[0], j + offset[1], k + offset[2]}};
+          Real factor = 1.0;
+          for (const auto a : make_range(dim))
+            factor *= foldIndex(c[a], info.M[a], periodic[a], faces, marlinAxis(dim, a), h);
+          MatStencil col{};
+          col.i = c[0], col.j = c[1], col.k = c[2];
+          cols.push_back(col);
+          values.push_back(factor * value);
+        }
+        row_fn(row, cols, values);
+      }
+}
+}
+
+Real
+FaceGhosts::factor(unsigned int face, unsigned int layer, Real h) const
+{
+  const auto a = ab[face][0], b = ab[face][1];
+  const auto s = (2.0 * layer + 1.0) * h;
+  return -(a / 2.0 - b / s) / (a / 2.0 + b / s);
 }
 
 Partition
@@ -76,6 +186,9 @@ gatherPartition(const DomainAction & domain)
   partition.n = domain.getGridSize();
   partition.parts = domain.getRealSpacePartitions();
   partition.index = domain.getRealSpaceIndex();
+  partition.periodic = domain.getPeriodicDirections();
+  for (const auto d : make_range(3))
+    partition.h[d] = domain.getGridSpacing()(d);
   partition.comm = domain.getMPIComm();
 
   int size;
@@ -168,33 +281,36 @@ buildHierarchy(const Partition & partition,
                unsigned int levels,
                PetscInt stencil_width,
                bool box,
+               const FaceGhosts & faces,
                Hierarchy & hierarchy)
 {
   const auto dim = partition.dim;
   const auto stencil_type = box ? DMDA_STENCIL_BOX : DMDA_STENCIL_STAR;
-  const auto periodic = DM_BOUNDARY_PERIODIC;
 
-  // global extents, ranks and slab sizes in DMDA axis order
+  // global extents, ranks, slab sizes and boundary types in DMDA axis order
   std::array<PetscInt, 3> M{{1, 1, 1}};
   std::array<PetscMPIInt, 3> procs{{1, 1, 1}};
   std::array<std::vector<PetscInt>, 3> counts;
+  std::array<DMBoundaryType, 3> bt{
+      {DM_BOUNDARY_PERIODIC, DM_BOUNDARY_PERIODIC, DM_BOUNDARY_PERIODIC}};
   for (const auto a : make_range(dim))
   {
     const auto m = marlinAxis(dim, a);
     M[a] = PetscInt(partition.n[m]);
     procs[a] = PetscMPIInt(partition.parts[m]);
     counts[a] = partition.counts[m];
+    bt[a] = partition.periodic[m] ? DM_BOUNDARY_PERIODIC : DM_BOUNDARY_NONE;
   }
 
   DM fine;
   if (dim == 1)
     PetscCallAbort(comm,
-                   DMDACreate1d(comm, periodic, M[0], 1, stencil_width, counts[0].data(), &fine));
+                   DMDACreate1d(comm, bt[0], M[0], 1, stencil_width, counts[0].data(), &fine));
   else if (dim == 2)
     PetscCallAbort(comm,
                    DMDACreate2d(comm,
-                                periodic,
-                                periodic,
+                                bt[0],
+                                bt[1],
                                 stencil_type,
                                 M[0],
                                 M[1],
@@ -208,9 +324,9 @@ buildHierarchy(const Partition & partition,
   else
     PetscCallAbort(comm,
                    DMDACreate3d(comm,
-                                periodic,
-                                periodic,
-                                periodic,
+                                bt[0],
+                                bt[1],
+                                bt[2],
                                 stencil_type,
                                 M[0],
                                 M[1],
@@ -224,6 +340,10 @@ buildHierarchy(const Partition & partition,
                                 counts[1].data(),
                                 counts[2].data(),
                                 &fine));
+  // DMCoarsen halves a non-periodic axis cell-centred (n -> n/2, as a periodic one) only
+  // for Q0 interpolation; otherwise vertex-centred (n -> 1 + (n-1)/2). The interpolation
+  // itself is cellCentredInterpolation, not the DMDA's.
+  PetscCallAbort(comm, DMDASetInterpolationType(fine, DMDA_Q0));
   PetscCallAbort(comm, DMSetUp(fine));
   hierarchy.dms.push_back(fine);
 
@@ -249,62 +369,83 @@ buildHierarchy(const Partition & partition,
   for (const auto l : index_range(coarse))
   {
     hierarchy.dms.push_back(coarse[l]);
-    hierarchy.interpolations.push_back(cellCentredInterpolation(coarse[l], hierarchy.dms[l]));
+    // level l + 1 has spacing 2^(l + 1) h
+    std::vector<Real> h_coarse(dim);
+    for (const auto d : make_range(dim))
+      h_coarse[d] = partition.h[d] * Real(2 << l);
+    hierarchy.interpolations.push_back(
+        cellCentredInterpolation(coarse[l], hierarchy.dms[l], faces, h_coarse));
   }
 }
 
 void
-assembleStencilOperator(DM da, const std::vector<FDStencilEntry> & stencil, PetscReal scale, Mat B)
+assembleStencilOperator(DM da,
+                        const std::vector<FDStencilEntry> & stencil,
+                        PetscReal scale,
+                        const FaceGhosts & faces,
+                        const std::vector<Real> & h,
+                        Mat B)
 {
   const MPI_Comm comm = PetscObjectComm((PetscObject)da);
-  const auto info = getInfo(da);
-  const auto dim = unsigned(info.dim);
-
-  // merge entries with the same offset, converted to DMDA axis order
-  std::map<std::array<PetscInt, 3>, PetscScalar> merged;
-  for (const auto & entry : stencil)
-  {
-    std::array<PetscInt, 3> offset{{0, 0, 0}};
-    for (const auto a : make_range(dim))
-      offset[a] = entry.offset[marlinAxis(dim, a)];
-    merged[offset] += scale * entry.coefficient;
-  }
-  std::vector<std::array<PetscInt, 3>> offsets;
-  std::vector<PetscScalar> values;
-  for (const auto & [offset, value] : merged)
-  {
-    offsets.push_back(offset);
-    values.push_back(value);
-  }
 
   // a MATPREALLOCATOR (createStencilMatrix) is never assembled and has no values
   PetscBool assembled;
   PetscCallAbort(comm, MatAssembled(B, &assembled));
   if (assembled)
     PetscCallAbort(comm, MatZeroEntries(B));
-  std::vector<MatStencil> cols(offsets.size());
-  for (PetscInt k = info.start[2]; k < info.start[2] + info.size[2]; ++k)
-    for (PetscInt j = info.start[1]; j < info.start[1] + info.size[1]; ++j)
-      for (PetscInt i = info.start[0]; i < info.start[0] + info.size[0]; ++i)
+  // periodic wrap of indices outside the domain is done by the DMDA; columns reached
+  // twice (offsets that wrap onto each other on a small periodic grid, or folded onto
+  // the same cell at a boundary face) are added, hence ADD_VALUES
+  forEachFoldedRow(
+      da,
+      stencil,
+      scale,
+      faces,
+      h,
+      [&](const MatStencil & row,
+          const std::vector<MatStencil> & cols,
+          const std::vector<PetscScalar> & values)
       {
-        MatStencil row{};
-        row.i = i, row.j = j, row.k = k;
-        // periodic wrap of indices outside the domain is done by the DMDA; offsets that
-        // wrap onto the same column (e.g. +-4 on 8 cells) are added, hence ADD_VALUES
-        for (const auto q : index_range(offsets))
-        {
-          cols[q] = row;
-          cols[q].i += offsets[q][0];
-          cols[q].j += offsets[q][1];
-          cols[q].k += offsets[q][2];
-        }
         PetscCallAbort(
             comm,
             MatSetValuesStencil(
                 B, 1, &row, PetscInt(cols.size()), cols.data(), values.data(), ADD_VALUES));
-      }
+      });
   PetscCallAbort(comm, MatAssemblyBegin(B, MAT_FINAL_ASSEMBLY));
   PetscCallAbort(comm, MatAssemblyEnd(B, MAT_FINAL_ASSEMBLY));
+}
+
+Real
+jacobiSpectrumBound(DM da,
+                    const std::vector<FDStencilEntry> & stencil,
+                    const FaceGhosts & faces,
+                    const std::vector<Real> & h)
+{
+  Real bound = 0.0;
+  forEachFoldedRow(da,
+                   stencil,
+                   1.0,
+                   faces,
+                   h,
+                   [&](const MatStencil & row,
+                       const std::vector<MatStencil> & cols,
+                       const std::vector<PetscScalar> & values)
+                   {
+                     // the matrix entries: values on the same column (folded or wrapped)
+                     // are added, as in assembleStencilOperator
+                     std::map<std::array<PetscInt, 3>, Real> row_values;
+                     for (const auto q : index_range(cols))
+                       row_values[{{cols[q].i, cols[q].j, cols[q].k}}] += values[q];
+                     Real centre = 0.0, off_diagonal = 0.0;
+                     for (const auto & [col, value] : row_values)
+                       if (col == std::array<PetscInt, 3>{{row.i, row.j, row.k}})
+                         centre += value;
+                       else
+                         off_diagonal += std::abs(value);
+                     bound = std::max(bound, 1.0 + off_diagonal / centre);
+                   });
+  MPI_Allreduce(MPI_IN_PLACE, &bound, 1, MPI_DOUBLE, MPI_MAX, PetscObjectComm((PetscObject)da));
+  return bound;
 }
 
 Mat
@@ -338,7 +479,13 @@ createStencilMatrix(DM da, const std::vector<FDStencilEntry> & stencil)
       comm,
       DMDAGetGhostCorners(da, &starts[0], &starts[1], &starts[2], &dims[0], &dims[1], &dims[2]));
   PetscCallAbort(comm, MatSetStencil(preallocator, info.dim, dims.data(), starts.data(), 1));
-  assembleStencilOperator(da, stencil, 1.0, preallocator);
+  // the folded columns are the same for any ghost factors (unit factors here, so no
+  // entry cancels)
+  FaceGhosts unit_faces;
+  for (auto & ab : unit_faces.ab)
+    ab = {0.0, 1.0};
+  assembleStencilOperator(
+      da, stencil, 1.0, unit_faces, std::vector<Real>(getInfo(da).dim, 1.0), preallocator);
 
   // preallocate exactly those columns and insert zeros there; any other column is an error
   PetscCallAbort(comm, MatPreallocatorPreallocate(preallocator, PETSC_TRUE, B));
@@ -347,12 +494,16 @@ createStencilMatrix(DM da, const std::vector<FDStencilEntry> & stencil)
 }
 
 Mat
-cellCentredInterpolation(DM coarse, DM fine)
+cellCentredInterpolation(DM coarse,
+                         DM fine,
+                         const FaceGhosts & faces,
+                         const std::vector<Real> & h_coarse)
 {
   const MPI_Comm comm = PetscObjectComm((PetscObject)fine);
   const auto fine_info = getInfo(fine);
   const auto coarse_info = getInfo(coarse);
   const auto dim = unsigned(fine_info.dim);
+  const auto periodic = periodicAxes(fine);
 
   // slab boundaries of the coarse ownership ranges, per DMDA axis
   std::array<const PetscInt *, 3> ranges{{nullptr, nullptr, nullptr}};
@@ -421,7 +572,9 @@ cellCentredInterpolation(DM coarse, DM fine)
       for (PetscInt i = start[0]; i < start[0] + size[0]; ++i, ++row)
       {
         const std::array<PetscInt, 3> f{{i, j, k}};
-        // tensor product of the per-axis parent and neighbour weights
+        // tensor product of the per-axis parent and neighbour weights; a neighbour
+        // outside a boundary face is the coarse ghost, factor * parent, so its weight
+        // goes to the parent
         for (const auto e : make_range(entries))
         {
           std::array<PetscInt, 3> c{{0, 0, 0}};
@@ -432,12 +585,15 @@ cellCentredInterpolation(DM coarse, DM fine)
             const bool neighbour = (e >> a) & 1;
             c[a] = neighbour ? (f[a] % 2 ? parent + 1 : parent - 1) : parent;
             w *= neighbour ? 0.25 : 0.75;
+            w *=
+                foldIndex(c[a], coarse_info.M[a], periodic[a], faces, marlinAxis(dim, a), h_coarse);
           }
           cols[e] = global_column(c);
           vals[e] = w;
         }
+        // folded neighbours share the parent's column
         PetscCallAbort(comm,
-                       MatSetValues(P, 1, &row, entries, cols.data(), vals.data(), INSERT_VALUES));
+                       MatSetValues(P, 1, &row, entries, cols.data(), vals.data(), ADD_VALUES));
       }
   PetscCallAbort(comm, MatAssemblyBegin(P, MAT_FINAL_ASSEMBLY));
   PetscCallAbort(comm, MatAssemblyEnd(P, MAT_FINAL_ASSEMBLY));
