@@ -13,9 +13,9 @@
 
 /**
  * General Robin boundary condition: a*u + b*du/dn = c on the given face,
- * where n is the outward normal. Both the explicit ghost-fill path
- * (fillGhostCells) and the implicit matrix-row/RHS path (stencilContribution)
- * are derived from the same (a, b, c) triple, so the two cannot drift apart.
+ * where n is the outward normal. The ghost fill (fillGhostCells) and the implicit
+ * solver's matrix entries (ghostCoefficientOnU0, also used by PetscFD::FaceGhosts on
+ * the coarse levels) share the ghost relation below, so the two cannot drift apart.
  * c may vary along the face (c_function or c_buffer); a and b are constants.
  */
 class TensorRobinBC : public TensorBoundaryCondition, public FunctionInterface
@@ -31,9 +31,6 @@ public:
                               int64_t owned_extent,
                               Real dx) const override;
 
-  virtual std::pair<std::vector<FDStencilEntry>, Real>
-  stencilContribution(unsigned int ghost_layers, Real dx) const override;
-
   /// exchange the halo of c_buffer along the face
   virtual void prepareFaceData() override;
 
@@ -41,7 +38,7 @@ public:
    * Solve a*(u0 + ughost)/2 + b*(ughost - u0)/dx = c for ughost = coefficient*u0 +
    * constant, with dx > 0 the unsigned spacing. The ghost cell lies on the outward
    * side of either face, so the same expression holds on the lower and upper face.
-   * Both fillGhostCellsStatic() and stencilContributionStatic() build from these.
+   * fillGhostCellsStatic() builds from these, with spacing 3 dx for the second layer.
    */
   static Real ghostCoefficientOnU0(Real a, Real b, Real dx);
   static Real ghostConstantTerm(Real a, Real b, Real c, Real dx);
@@ -58,10 +55,6 @@ public:
                                    Real b,
                                    const torch::Tensor & c,
                                    Real dx);
-
-  /// Object-independent core of stencilContribution(), used by the instance method and the unit test.
-  static std::pair<std::vector<FDStencilEntry>, Real>
-  stencilContributionStatic(unsigned int dim, Real a, Real b, Real c, Real dx);
 
   /// the constant Robin coefficients a and b
   Real a() const { return _a; }

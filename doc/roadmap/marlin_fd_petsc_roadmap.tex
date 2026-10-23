@@ -424,22 +424,24 @@ Section~\ref{sec:risks}.
 \begin{schematic}
 \begin{verbatim}
 TensorRobinBC(a, b, c) for buffer "u" on face "left"
+ghost = ghostCoefficientOnU0(a, b, s) * mirror + c / (a/2 + b/s),
+s = (2l+1) dx for ghost layer l
      |
-     +--> fillGhostCells(u)            [explicit / matrix-free path]
-     |      ghost value = one-sided extrapolation from a,b,c
-     |      consumed by: nonlinear computeBuffer() evaluations,
-     |                   explicit solvers, visualization
+     +--> fillGhostCells(u)              [ghost fill]
+     |      consumed by: explicit computes and solvers, and the
+     |                   implicit fine level (matrix-free A(x) - A(0),
+     |                   b - A(0): the affine split)
      |
-     +--> applyGhostContribution(idx)  [implicit / matrix-free path]
-            action/RHS edit derived from the SAME a,b,c
-            consumed by: PetscFDSolverBase's MatMult callback / assembleRHS
-            (an assembled-matrix stencilAt() variant of this exists only
-             for the PR4a fallback)
+     +--> ghostCoefficientOnU0(a, b, s)  [implicit matrix entries]
+            consumed by: the torch PCG Jacobi diagonal, and
+                         PetscFD::FaceGhosts::factor on the coarse
+                         levels (folded rows, interpolation)
 
-INVARIANT: both derive from one a,b,c triple in one class.
-REQUIRED TEST (not optional): a test that runs BOTH paths on the same
-BC instance and checks they imply the same boundary value/flux --
-not just that each individually "looks reasonable" in isolation.
+INVARIANT: both derive from one a,b triple and one ghost relation.
+REQUIRED TEST (not optional): the ghost fill's dependence on each
+mirror cell (fill(u) - fill(0)) equals the coefficients the implicit
+solver writes, for both ghost layers and both faces
+(TensorBoundaryConditionTest), and the fill satisfies a u + b du/dn = c.
 \end{verbatim}
 \end{schematic}
 
