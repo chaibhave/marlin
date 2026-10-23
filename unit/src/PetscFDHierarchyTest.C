@@ -59,7 +59,7 @@ uniformPartition(unsigned int dim, int64_t n)
 
 /// the same partition with boundary faces (spacing 1/n) on the Marlin axes not in periodic
 PetscFD::Partition
-wallPartition(unsigned int dim, int64_t n, std::array<bool, 3> periodic)
+boundedPartition(unsigned int dim, int64_t n, std::array<bool, 3> periodic)
 {
   auto p = uniformPartition(dim, n);
   p.periodic = periodic;
@@ -424,7 +424,7 @@ TEST(PetscFDHierarchyTest, CellCentredInterpolationWithFaces)
   {
     const int64_t n = dim == 3 ? 16 : 32;
     // Marlin axis 0 has faces; axis 1 periodic in 2D and 3D, axis 2 faces in 3D
-    const auto partition = wallPartition(dim, n, {false, true, false});
+    const auto partition = boundedPartition(dim, n, {false, true, false});
     MPI_Comm comm = PetscFD::dmdaComm(partition);
     for (const bool dirichlet : {false, true})
     {
@@ -492,7 +492,7 @@ TEST(PetscFDHierarchyTest, AssembledOperatorWithFaces)
       {
         const int64_t n = 32;
         // faces on Marlin axis 0, axis 1 periodic
-        const auto partition = wallPartition(dim, n, {false, true, true});
+        const auto partition = boundedPartition(dim, n, {false, true, true});
         MPI_Comm comm = PetscFD::dmdaComm(partition);
         {
           const auto faces = dirichlet ? uniformFaces(1.0, 0.0) : uniformFaces(0.0, 1.0);
@@ -546,7 +546,7 @@ TEST(PetscFDHierarchyTest, AssembledOperatorWithFaces)
 TEST(PetscFDHierarchyTest, AssembledOperatorWithRobinFace)
 {
   const int64_t n = 16;
-  const auto partition = wallPartition(1, n, {false, true, true});
+  const auto partition = boundedPartition(1, n, {false, true, true});
   MPI_Comm comm = PetscFD::dmdaComm(partition);
   {
     // lower face Robin a = 2, b = 0.3; upper face Dirichlet
@@ -592,7 +592,7 @@ TEST(PetscFDHierarchyTest, JacobiSpectrumBoundWithFaces)
   const auto stencil = FiniteDifferenceLaplacian::buildStencil(1, true, dx, -1.0);
   for (const bool faces_present : {false, true})
   {
-    const auto partition = wallPartition(1, n, {!faces_present, true, true});
+    const auto partition = boundedPartition(1, n, {!faces_present, true, true});
     MPI_Comm comm = PetscFD::dmdaComm(partition);
     {
       const auto faces = uniformFaces(0.0, 1.0);

@@ -732,9 +732,9 @@ TensorProblem::exchangeGhostLayers(const std::string & buffer_name,
 
   const int64_t halo = static_cast<int64_t>(_max_ghost_layers);
 
-  // ghost cells on a physical wall: from the boundary condition, or, for face data (a boundary
-  // condition's c_buffer), the nearest owned layer
-  const auto fill_wall = [&](unsigned int d, bool lower)
+  // ghost cells on a non-periodic boundary: from the boundary condition, or, for face data (a
+  // boundary condition's c_buffer), the nearest owned layer
+  const auto fill_boundary = [&](unsigned int d, bool lower)
   {
     if (face_axis < 0)
       fillBoundaryGhosts(buffer_name, tensor, d, lower, ghost_layers, halo, owned[d]);
@@ -764,8 +764,8 @@ TensorProblem::exchangeGhostLayers(const std::string & buffer_name,
       }
       else
       {
-        fill_wall(d, /*lower=*/true);
-        fill_wall(d, /*lower=*/false);
+        fill_boundary(d, /*lower=*/true);
+        fill_boundary(d, /*lower=*/false);
       }
       continue;
     }
@@ -798,7 +798,7 @@ TensorProblem::exchangeGhostLayers(const std::string & buffer_name,
           neighbor[d] = part - 1;
         else
         {
-          fill_wall(d, /*lower=*/true);
+          fill_boundary(d, /*lower=*/true);
           return;
         }
       }
@@ -810,7 +810,7 @@ TensorProblem::exchangeGhostLayers(const std::string & buffer_name,
           neighbor[d] = 0;
         else
         {
-          fill_wall(d, /*lower=*/false);
+          fill_boundary(d, /*lower=*/false);
           return;
         }
       }

@@ -132,7 +132,7 @@ ImplicitFDSolver::ImplicitFDSolver(const InputParameters & parameters)
   if (!_domain.isRealSpaceMode())
     mooseError("ImplicitFDSolver requires Domain/parallel_mode = REAL_SPACE.");
   const auto & periodic = _domain.getPeriodicDirections();
-  const bool has_walls = std::any_of(
+  const bool has_boundaries = std::any_of(
       periodic.begin(), periodic.begin() + _dim, [](bool is_periodic) { return !is_periodic; });
 
   const auto & buffers = getParam<std::vector<TensorOutputBufferName>>("buffer");
@@ -205,7 +205,7 @@ ImplicitFDSolver::ImplicitFDSolver(const InputParameters & parameters)
                      "factor = -D.");
       }
 
-      if (has_walls && dynamic_cast<const FiniteDifferenceBiharmonic *>(fd_op))
+      if (has_boundaries && dynamic_cast<const FiniteDifferenceBiharmonic *>(fd_op))
         paramError("operators",
                    "Operator '",
                    op_name,
@@ -218,13 +218,13 @@ ImplicitFDSolver::ImplicitFDSolver(const InputParameters & parameters)
           &_tensor_problem.getBufferBase(op.getParam<TensorOutputBufferName>("buffer")));
     }
 
-    // A wall's a*u + b*du/dn = c sets the ghost next to the wall cell u0 to coeff*u0 + const,
-    // which changes only the diagonal of the 3-point operator, so it stays symmetric. With
+    // A boundary face's a*u + b*du/dn = c sets the ghost next to the face cell u0 to coeff*u0 +
+    // const, which changes only the diagonal of the 3-point operator, so it stays symmetric. With
     // a/(a/2 + b/dx) > 0 (coeff < 1, e.g. Dirichlet) it becomes definite, with a = 0
     // (Neumann, coeff = 1) it keeps the constants as nullspace, and otherwise it can be
     // indefinite. The 5-point stencil's second ghost uses spacing 3dx, so its operator is
     // symmetric only where both ghost coefficients agree: for Dirichlet and Neumann.
-    field._walls.assign(2 * _dim, nullptr);
+    field._face_bcs.assign(2 * _dim, nullptr);
     for (const auto face : make_range(2 * _dim))
     {
       const auto d = face / 2;
@@ -234,17 +234,17 @@ ImplicitFDSolver::ImplicitFDSolver(const InputParameters & parameters)
       const auto * bc = _tensor_problem.getBoundaryCondition(buffers[i], face);
       if (!bc)
         continue;
-      const auto * wall = dynamic_cast<const TensorRobinBC *>(bc);
-      if (!wall)
+      const auto * face_bc = dynamic_cast<const TensorRobinBC *>(bc);
+      if (!face_bc)
         paramError("buffer",
                    "Boundary condition '",
                    bc->name(),
                    "' of field '",
                    buffers[i],
                    "' is not a TensorRobinBC, which ImplicitFDSolver requires.");
-      field._walls[face] = wall;
+      field._face_bcs[face] = face_bc;
 
-      const auto a = wall->a(), b = wall->b();
+      const auto a = face_bc->a(), b = face_bc->b();
       const auto dx = _domain.getGridSpacing()(d);
       if (a != 0.0 && a / (a / 2.0 + b / dx) < 0.0)
         paramError("buffer",
@@ -330,10 +330,11 @@ ImplicitFDSolver::substep()
     // warm start from u_old
     torch::Tensor x = field._u_base.ownedView().clone(torch::MemoryFormat::Contiguous);
 
-    // with walls the operator action is affine, sum_i A_i x + g with g from the boundary
+    // with boundary faces the operator action is affine, sum_i A_i x + g with g from the boundary
     // values: solve the linear part with b - g (g = sum_i A_i 0, for the current values)
-    if (std::any_of(
-            field._walls.begin(), field._walls.end(), [](const auto * wall) { return wall; }))
+    if (std::any_of(field._face_bcs.begin(),
+                    field._face_bcs.end(),
+                    [](const auto * face_bc) { return face_bc; }))
     {
       field._affine = applyOperator(field, torch::zeros_like(b));
       b -= field._affine;
@@ -466,21 +467,21 @@ ImplicitFDSolver::jacobiDiagonal(const Field & field) const
   auto diag = torch::full(
       field._u_base.ownedView().sizes(), diagonal(field), MooseTensor::floatTensorOptions());
 
-  // In the cell u0 next to a wall, the entry reaching across the wall (offset -1 or +1
+  // In the cell u0 next to a boundary face, the entry reaching across the face (offset -1 or +1
   // along the normal) multiplies the ghost coeff*u0 + const, adding coefficient*coeff to
   // the diagonal. Deeper ghosts mirror other cells, so they are off-diagonal.
   const auto & index = _domain.getRealSpaceIndex();
   const auto & partitions = _domain.getRealSpacePartitions();
-  for (const auto face : index_range(field._walls))
+  for (const auto face : index_range(field._face_bcs))
   {
-    const auto * wall = field._walls[face];
+    const auto * face_bc = field._face_bcs[face];
     const auto d = face / 2;
     const bool upper = face % 2;
-    if (!wall || index[d] != (upper ? partitions[d] - 1 : 0))
+    if (!face_bc || index[d] != (upper ? partitions[d] - 1 : 0))
       continue;
 
-    const auto coeff =
-        TensorRobinBC::ghostCoefficientOnU0(wall->a(), wall->b(), _domain.getGridSpacing()(d));
+    const auto coeff = TensorRobinBC::ghostCoefficientOnU0(
+        face_bc->a(), face_bc->b(), _domain.getGridSpacing()(d));
     Real across = 0.0;
     for (const auto * fd_op : field._fd_operators)
       for (const auto & entry : fd_op->stencilAt())
@@ -503,7 +504,8 @@ ImplicitFDSolver::solveTorchPCG(Field & field,
                                 Real b_norm,
                                 torch::Tensor & x)
 {
-  // Jacobi preconditioner; with constant coefficients the diagonal is constant away from walls
+  // Jacobi preconditioner; with constant coefficients the diagonal is constant away from boundary
+  // faces
   const auto inv_diag = jacobiDiagonal(field).reciprocal();
   const auto A = [&](const torch::Tensor & v) { return applyLinearOperator(field, v); };
   const auto M = [&inv_diag](const torch::Tensor & r) { return r * inv_diag; };
@@ -555,12 +557,12 @@ sameStencil(const std::vector<FDStencilEntry> & a, const std::vector<FDStencilEn
 
 /// the homogeneous ghost relations of a field's boundary faces
 PetscFD::FaceGhosts
-faceGhosts(const std::vector<const TensorRobinBC *> & walls)
+faceGhosts(const std::vector<const TensorRobinBC *> & face_bcs)
 {
   PetscFD::FaceGhosts faces;
-  for (const auto face : index_range(walls))
-    if (walls[face])
-      faces.ab[face] = {walls[face]->a(), walls[face]->b()};
+  for (const auto face : index_range(face_bcs))
+    if (face_bcs[face])
+      faces.ab[face] = {face_bcs[face]->a(), face_bcs[face]->b()};
   return faces;
 }
 
@@ -641,7 +643,7 @@ ImplicitFDSolver::setupPetsc(Field & field)
                           levels,
                           width,
                           PetscFD::needsBoxStencil(stencil),
-                          faceGhosts(field._walls),
+                          faceGhosts(field._face_bcs),
                           *ps.hierarchy);
   auto & hierarchy = *ps.hierarchy;
 
@@ -797,7 +799,7 @@ ImplicitFDSolver::assembleCoarseLevels(Field & field)
   const auto levels = ps.coarse.size() + 1;
   // the coarse rows next to a boundary face fold the ghosts with the homogeneous
   // condition at the level's spacing (the boundary values enter the fine residual only)
-  const auto faces = faceGhosts(field._walls);
+  const auto faces = faceGhosts(field._face_bcs);
   PC pc;
   PetscCallAbort(comm, KSPGetPC(ps.ksp, &pc));
   // the smoother weights are set only for PCMG (not e.g. for -<buffer>_pc_type jacobi)
