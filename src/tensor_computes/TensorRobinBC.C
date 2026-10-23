@@ -129,24 +129,6 @@ TensorRobinBC::fillGhostCellsStatic(torch::Tensor & buffer,
   }
 }
 
-std::pair<std::vector<FDStencilEntry>, Real>
-TensorRobinBC::stencilContributionStatic(unsigned int dim, Real a, Real b, Real c, Real dx)
-{
-  // Substitute the SAME ghost-value formula used by fillGhostCells(Static)
-  // (ughost = coeff*u0 + rhs) into the interior stencil's u0 row: any
-  // reference to the ghost cell is replaced by `coeff` times the
-  // boundary-adjacent interior unknown u0 plus a constant `rhs`. The caller
-  // (a future implicit assembler) is responsible for folding this
-  // coefficient into its own stencil row at the u0 offset; here we report
-  // it as a single-entry stencil (offset 0 along faceDim(), i.e. "the
-  // ghost's dependence on u0") plus the resulting constant contribution.
-  const auto coeff = ghostCoefficientOnU0(a, b, dx);
-  const auto rhs = ghostConstantTerm(a, b, c, dx);
-
-  std::vector<int> offset(dim, 0);
-  return {std::vector<FDStencilEntry>{FDStencilEntry{offset, coeff}}, rhs};
-}
-
 void
 TensorRobinBC::fillGhostCells(torch::Tensor & buffer,
                               unsigned int ghost_layers,
@@ -235,15 +217,4 @@ TensorRobinBC::functionFaceValue(Real t) const
   return torch::tensor(values, torch::TensorOptions().dtype(torch::kDouble))
       .reshape(face_shape)
       .to(MooseTensor::floatTensorOptions());
-}
-
-std::pair<std::vector<FDStencilEntry>, Real>
-TensorRobinBC::stencilContribution(unsigned int ghost_layers, Real dx) const
-{
-  // only the first ghost relation is reported; a second ghost layer is not represented.
-  // The constant term is that of the scalar c (a face-varying c enters through fillGhostCells).
-  if (ghost_layers != 1)
-    mooseError("TensorRobinBC::stencilContribution supports one ghost layer only.");
-
-  return stencilContributionStatic(_dim, _a, _b, _c, dx);
 }

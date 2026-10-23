@@ -7,12 +7,19 @@
 /**********************************************************************/
 
 #include "TensorRobinBC.h"
+#include "PetscFDHierarchy.h"
 #include "MarlinUtils.h"
 #include "gtest/gtest.h"
 
-// fillGhostCellsStatic() (the explicit/matrix-free path) and
-// stencilContributionStatic() (the implicit path) must, for the same (a, b, c, dx),
-// imply the same ghost value, and that ghost value must satisfy the Robin condition
+#include "libmesh/int_range.h"
+
+#include <array>
+
+// fillGhostCellsStatic() (the ghost fill, which the explicit computes and the implicit
+// solver's fine level both use) and the ghost coefficients the implicit solver writes into
+// its matrices (ghostCoefficientOnU0() in the Jacobi diagonal, PetscFD::FaceGhosts::factor()
+// on the coarse multigrid levels) must, for the same (a, b, dx), imply the same dependence
+// of each ghost on its mirror cell, and the ghost value must satisfy the Robin condition
 // itself. The second check is independent of the shared ghostCoefficientOnU0() /
 // ghostConstantTerm() helpers, so a sign error in them is caught.
 namespace
@@ -23,50 +30,69 @@ scalar(Real c)
   return torch::tensor(c, MooseTensor::floatTensorOptions());
 }
 
-// Checks fillGhostCellsStatic() and stencilContributionStatic() agree, and satisfy
-// the BC, for one Robin triple (a, b, c), on both the lower and upper face of a small
-// 1D interior field.
+// Checks that the ghost fill and the implicit solver's ghost coefficients agree, and that
+// the fill satisfies the BC, for one Robin triple (a, b, c), on both the lower and upper face
+// of a small 1D field, for both ghost layers.
 void
 checkDualPath(Real a, Real b, Real c, Real dx)
 {
   const int64_t halo = 2;
   const int64_t owned_extent = 4;
   const int64_t total = owned_extent + 2 * halo;
-  const Real u0_lower = 1.7;  // boundary-adjacent interior value, lower face
-  const Real u0_upper = -0.4; // boundary-adjacent interior value, upper face
+  // owned cells 0 and 1 from the face (the mirrors of ghost layers 0 and 1)
+  const std::array<Real, 2> u_lower{{1.7, 0.6}}, u_upper{{-0.4, 1.1}};
+
+  PetscFD::FaceGhosts faces;
+  faces.ab[0] = faces.ab[1] = {a, b};
+
+  // ghost values come from a tensor op (fillGhostCellsStatic), which may run in
+  // single precision depending on the active compute device/dtype setting;
+  // the predictions are plain double arithmetic, so the tolerance must
+  // allow for that precision gap, not just floating-point roundoff.
+  const Real tolerance =
+      MooseTensor::floatTensorOptions().dtype() == torch::kFloat64 ? 1e-12 : 1e-6;
 
   for (const bool is_upper_face : {false, true})
   {
-    auto buffer = torch::zeros({total}, MooseTensor::floatTensorOptions());
-    const auto u0 = is_upper_face ? u0_upper : u0_lower;
-    buffer[is_upper_face ? halo + owned_extent - 1 : halo] = u0;
+    const auto & u = is_upper_face ? u_upper : u_lower;
+    const auto owned = [&](int64_t l)
+    { return is_upper_face ? halo + owned_extent - 1 - l : halo + l; };
+    const auto ghost = [&](int64_t l)
+    { return is_upper_face ? halo + owned_extent + l : halo - 1 - l; };
+    const auto fill = [&](const std::array<Real, 2> & values)
+    {
+      auto buffer = torch::zeros({total}, MooseTensor::floatTensorOptions());
+      for (const auto l : make_range(2))
+        buffer[owned(l)] = values[l];
+      TensorRobinBC::fillGhostCellsStatic(buffer,
+                                          is_upper_face,
+                                          /*face_dim=*/0,
+                                          /*ghost_layers=*/2,
+                                          halo,
+                                          owned_extent,
+                                          a,
+                                          b,
+                                          scalar(c),
+                                          dx);
+      return buffer;
+    };
+    const auto buffer = fill(u);
+    // the ghosts of the zero field hold c's part, which the implicit solver takes from the fill
+    // itself (its affine split); the rest is the homogeneous part it writes into its matrices
+    const auto offset = fill({{0.0, 0.0}});
 
-    TensorRobinBC::fillGhostCellsStatic(buffer,
-                                        is_upper_face,
-                                        /*face_dim=*/0,
-                                        /*ghost_layers=*/1,
-                                        halo,
-                                        owned_extent,
-                                        a,
-                                        b,
-                                        scalar(c),
-                                        dx);
+    for (const auto l : make_range(2))
+    {
+      const auto homogeneous = buffer[ghost(l)].item<double>() - offset[ghost(l)].item<double>();
+      EXPECT_NEAR(homogeneous, faces.factor(is_upper_face, l, dx) * u[l], tolerance)
+          << "a=" << a << " b=" << b << " c=" << c << " dx=" << dx
+          << " is_upper_face=" << is_upper_face << " layer=" << l;
+      if (l == 0)
+        EXPECT_NEAR(homogeneous, TensorRobinBC::ghostCoefficientOnU0(a, b, dx) * u[0], tolerance);
+    }
 
-    const auto ghost_value = buffer[is_upper_face ? halo + owned_extent : halo - 1].item<double>();
-
-    const auto [stencil, rhs] = TensorRobinBC::stencilContributionStatic(1, a, b, c, dx);
-    ASSERT_EQ(stencil.size(), 1u);
-    const auto predicted_ghost_value = stencil[0].coefficient * u0 + rhs;
-
-    // ghost_value comes from a tensor op (fillGhostCellsStatic), which may run in
-    // single precision depending on the active compute device/dtype setting;
-    // predicted_ghost_value is plain double arithmetic, so the tolerance must
-    // allow for that precision gap, not just floating-point roundoff.
-    const Real tolerance =
-        MooseTensor::floatTensorOptions().dtype() == torch::kFloat64 ? 1e-12 : 1e-6;
-    EXPECT_NEAR(ghost_value, predicted_ghost_value, tolerance)
-        << "a=" << a << " b=" << b << " c=" << c << " dx=" << dx
-        << " is_upper_face=" << is_upper_face;
+    const auto u0 = u[0];
+    const auto ghost_value = buffer[ghost(0)].item<double>();
 
     // the ghost satisfies a*u + b*du/dn = c at the face: u = (u0 + ughost)/2 and,
     // since the ghost lies on the outward side of either face, du/dn = (ughost - u0)/dx

@@ -7,6 +7,7 @@
 /**********************************************************************/
 #include "PetscFDHierarchy.h"
 #include "DomainAction.h"
+#include "TensorRobinBC.h"
 
 #include "libmesh/int_range.h"
 
@@ -173,9 +174,8 @@ forEachFoldedRow(DM da,
 Real
 FaceGhosts::factor(unsigned int face, unsigned int layer, Real h) const
 {
-  const auto a = ab[face][0], b = ab[face][1];
-  const auto s = (2.0 * layer + 1.0) * h;
-  return -(a / 2.0 - b / s) / (a / 2.0 + b / s);
+  // the ghost in layer l and its mirror are (2l + 1) h apart
+  return TensorRobinBC::ghostCoefficientOnU0(ab[face][0], ab[face][1], (2.0 * layer + 1.0) * h);
 }
 
 Partition
