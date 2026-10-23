@@ -134,10 +134,6 @@ ImplicitFDSolver::ImplicitFDSolver(const InputParameters & parameters)
   const auto & periodic = _domain.getPeriodicDirections();
   const bool has_walls = std::any_of(
       periodic.begin(), periodic.begin() + _dim, [](bool is_periodic) { return !is_periodic; });
-  if (has_walls && _linear_solver == LinearSolver::PETSC)
-    paramError("linear_solver",
-               "The PETSC linear solver does not support non-periodic domains yet. Use "
-               "linear_solver = TORCH_PCG.");
 
   const auto & buffers = getParam<std::vector<TensorOutputBufferName>>("buffer");
   const auto & operators = getParam<std::vector<std::vector<TensorComputeName>>>("operators");
@@ -557,14 +553,15 @@ sameStencil(const std::vector<FDStencilEntry> & a, const std::vector<FDStencilEn
   return true;
 }
 
-/// Gershgorin bound on the spectrum of D^-1 A for the periodic constant-coefficient
-/// operator with this stencil (D the summed centre coefficient): 1 + sum_{o != 0} |a_o| / D.
-/// Entries are not merged by offset; the triangle inequality keeps it an upper bound.
-Real
-jacobiSpectrumBound(const std::vector<FDStencilEntry> & stencil)
+/// the homogeneous ghost relations of a field's boundary faces
+PetscFD::FaceGhosts
+faceGhosts(const std::vector<const TensorRobinBC *> & walls)
 {
-  const auto [centre, off_diagonal] = centreAndOffDiagonal(stencil);
-  return 1.0 + off_diagonal / centre;
+  PetscFD::FaceGhosts faces;
+  for (const auto face : index_range(walls))
+    if (walls[face])
+      faces.ab[face] = {walls[face]->a(), walls[face]->b()};
+  return faces;
 }
 
 #if MARLIN_PETSC_CUDA
@@ -639,8 +636,13 @@ ImplicitFDSolver::setupPetsc(Field & field)
   const auto width = PetscFD::stencilWidth(stencil);
   const auto levels = PetscFD::countLevels(partition, width);
   ps.hierarchy = std::make_unique<PetscFD::Hierarchy>();
-  PetscFD::buildHierarchy(
-      partition, comm, levels, width, PetscFD::needsBoxStencil(stencil), *ps.hierarchy);
+  PetscFD::buildHierarchy(partition,
+                          comm,
+                          levels,
+                          width,
+                          PetscFD::needsBoxStencil(stencil),
+                          faceGhosts(field._walls),
+                          *ps.hierarchy);
   auto & hierarchy = *ps.hierarchy;
 
   const bool cuda = onCuda();
@@ -793,6 +795,9 @@ ImplicitFDSolver::assembleCoarseLevels(Field & field)
   const auto comm = ps.comm;
   const auto & grid_spacing = _domain.getGridSpacing();
   const auto levels = ps.coarse.size() + 1;
+  // the coarse rows next to a boundary face fold the ghosts with the homogeneous
+  // condition at the level's spacing (the boundary values enter the fine residual only)
+  const auto faces = faceGhosts(field._walls);
   PC pc;
   PetscCallAbort(comm, KSPGetPC(ps.ksp, &pc));
   // the smoother weights are set only for PCMG (not e.g. for -<buffer>_pc_type jacobi)
@@ -815,7 +820,8 @@ ImplicitFDSolver::assembleCoarseLevels(Field & field)
       // This scales only the preconditioner.
       const PetscReal scale = std::pow(2.0, Real(_dim * k));
       auto & B = ps.coarse[k - 1];
-      PetscFD::assembleStencilOperator(ps.hierarchy->dms[k], level_stencil, scale, B);
+      PetscFD::assembleStencilOperator(
+          ps.hierarchy->dms[k], level_stencil, scale, faces, spacing, B);
       // assembly clears MAT_SPD
       if (!field._singular)
       {
@@ -833,9 +839,10 @@ ImplicitFDSolver::assembleCoarseLevels(Field & field)
     }
 
     // damped Jacobi weight of the level smoother (PCMG level 0 is the coarse LU when
-    // levels > 1). The spectrum of D^-1 A lies in [0, rho], rho the Gershgorin bound (the
-    // 2^(dim k) scaling cancels); omega = 4 / (3 rho) damps the upper half [rho/2, rho]
-    // by at least 1/3 per sweep and keeps |1 - omega lambda| < 1 on (0, rho].
+    // levels > 1). The spectrum of D^-1 A lies in [0, rho], rho the Gershgorin bound, the
+    // maximum over rows including those next to a boundary face (the 2^(dim k) scaling
+    // cancels); omega = 4 / (3 rho) damps the upper half [rho/2, rho] by at least 1/3 per
+    // sweep and keeps |1 - omega lambda| < 1 on (0, rho].
     const auto pcmg_level = levels - 1 - k;
     if (!set_weights || (levels > 1 && pcmg_level == 0))
       continue;
@@ -849,8 +856,11 @@ ImplicitFDSolver::assembleCoarseLevels(Field & field)
                    PetscOptionsHasName(nullptr, prefix, "-ksp_richardson_scale", &user_scale));
     // KSPRichardsonSetScale is a no-op if the user changed the smoother type
     if (!user_scale)
-      PetscCallAbort(
-          comm, KSPRichardsonSetScale(smoother, 4.0 / (3.0 * jacobiSpectrumBound(level_stencil))));
+      PetscCallAbort(comm,
+                     KSPRichardsonSetScale(
+                         smoother,
+                         4.0 / (3.0 * PetscFD::jacobiSpectrumBound(
+                                          ps.hierarchy->dms[k], level_stencil, faces, spacing))));
   }
 
   // the shell's action changed too; bump its state and reset the KSP operators so
@@ -983,6 +993,34 @@ ImplicitFDSolver::shellDiagonal(Mat A, Vec d)
   PetscSolve * ps;
   PetscFunctionBeginUser;
   PetscCall(MatShellGetContext(A, &ps));
-  PetscCall(VecSet(d, ps->solver->diagonal(*ps->field)));
+  // with boundary faces the diagonal varies next to them: copy the owned tensor into d,
+  // which lives on the host or (VECCUDA) on the device
+  PetscScalar * array;
+  PetscMemType memtype;
+  PetscCall(VecGetArrayWriteAndMemType(d, &array, &memtype));
+  auto options = MooseTensor::floatTensorOptions().device(torch::kCPU);
+#if MARLIN_PETSC_CUDA
+  std::unique_ptr<PetscStreamGuard> guard;
+  if (PetscMemTypeDevice(memtype))
+  {
+    options = options.device(torch::kCUDA, c10::cuda::current_device());
+    guard = std::make_unique<PetscStreamGuard>();
+  }
+#endif
+  // C++ exceptions must not unwind through PETSc's C frames: keep it for solvePetsc
+  PetscErrorCode ierr = PETSC_SUCCESS;
+  try
+  {
+    const auto diag = ps->solver->jacobiDiagonal(*ps->field);
+    torch::from_blob(array, diag.sizes(), options).copy_(diag);
+  }
+  catch (...)
+  {
+    ps->exception = std::current_exception();
+    ierr = PETSC_ERR_LIB;
+  }
+  PetscCall(VecRestoreArrayWriteAndMemType(d, &array));
+  PetscCheck(
+      ierr == PETSC_SUCCESS, PETSC_COMM_SELF, ierr, "The Jacobi diagonal threw an exception");
   PetscFunctionReturn(PETSC_SUCCESS);
 }

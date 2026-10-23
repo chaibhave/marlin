@@ -511,6 +511,50 @@
     []
   []
 
+  [walls_petsc]
+    requirement = 'The system shall solve implicit finite-difference problems on a domain with walls, with Dirichlet, Neumann and Robin conditions whose values vary along the face, matching an independent sparse direct solve of the same discretisation, using the PETSc conjugate gradient solver with geometric multigrid, for'
+    [poisson_3pt]
+      type = CSVDiff
+      input = wall_mms.i
+      cli_args = 'TensorSolver/linear_solver=PETSC Outputs/file_base=wall_poisson_3pt'
+      csvdiff = wall_poisson_3pt.csv
+      rel_err = 1e-6
+      prereq = 'walls/poisson_3pt'
+      compute_devices = 'cpu'
+      detail = 'the steady Poisson problem with the 3-point stencil and a Robin face,'
+    []
+    [poisson_5pt]
+      type = CSVDiff
+      input = wall_mms.i
+      cli_args = 'TensorSolver/linear_solver=PETSC stencil=5 rb=0 Outputs/file_base=wall_poisson_5pt'
+      csvdiff = wall_poisson_5pt.csv
+      rel_err = 1e-6
+      prereq = 'walls/poisson_5pt'
+      compute_devices = 'cpu'
+      detail = 'the steady Poisson problem with the 5-point stencil,'
+    []
+    [be_3pt]
+      type = CSVDiff
+      input = wall_mms.i
+      cli_args = 'TensorSolver/linear_solver=PETSC tf=1 ops="dudt lap" num_steps=2 Outputs/file_base=wall_be_3pt'
+      csvdiff = wall_be_3pt.csv
+      rel_err = 1e-6
+      prereq = 'walls/be_3pt'
+      compute_devices = 'cpu'
+      detail = 'backward Euler with time-dependent boundary values and the 3-point stencil, and'
+    []
+    [be_5pt]
+      type = CSVDiff
+      input = wall_mms.i
+      cli_args = 'TensorSolver/linear_solver=PETSC tf=1 ops="dudt lap" num_steps=2 stencil=5 rb=0 Outputs/file_base=wall_be_5pt'
+      csvdiff = wall_be_5pt.csv
+      rel_err = 1e-6
+      prereq = 'walls/be_5pt'
+      compute_devices = 'cpu'
+      detail = 'backward Euler with time-dependent boundary values and the 5-point stencil.'
+    []
+  []
+
   [errors]
     requirement = 'The system shall report an error if an implicit finite-difference solve is set up '
     [not_spd]
@@ -603,14 +647,6 @@
       cli_args = 'ra=-1'
       expect_err = 'makes the operator indefinite'
       detail = 'with a Robin wall that makes the operator indefinite,'
-    []
-    [wall_petsc]
-      type = RunException
-      input = wall_mms.i
-      cli_args = 'TensorSolver/linear_solver=PETSC'
-      expect_err = 'The PETSC linear solver does not support non-periodic domains yet'
-      compute_devices = 'cpu'
-      detail = 'with walls and the PETSc linear solver,'
     []
     [not_fd_operator]
       type = RunException
