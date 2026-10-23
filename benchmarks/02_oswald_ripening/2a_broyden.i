@@ -120,7 +120,7 @@ cvalues= 'sqrt(2) 0.3 0.7 5     1 5 5'
       extra_symbols = true
       expression = 'c0+epsilon*(cos(0.105*x)*cos(0.11*y)+(cos(0.13*x)*cos(0.087*y))^2+cos(0.025*x-0.15*y)*cos(0.07*x-0.02*y))'
       constant_names = 'c0 epsilon'
-      constant_expressions = '0.5 0.01'
+      constant_expressions = '0.5 0.05'
     []
     [Lbar]
       type = ReciprocalLaplacianFactor
