@@ -1404,7 +1404,7 @@ implicit paths.
 \item The Robin value $c$ (Dirichlet \texttt{value}, Neumann \texttt{flux}) varies along the
 face, from a MOOSE \texttt{Function} at the face position and the solve time, or from a
 buffer whose first owned layer holds the face value (tangential halo exchanged). $a$ and
-$b$ stay scalar. The implicit solve takes the values at $t^{n+1}$.
+$b$ stay scalar. The implicit solve evaluates functions at $t^{n+1}$; a buffer holds what its compute wrote at the start of the substep, $t^n$.
 \item Fine level: the operator action is affine; each solve takes $b \leftarrow b - A(0)$
 and applies $A(x) - A(0)$, so the discretisation is unchanged. The torch PCG Jacobi
 diagonal includes the ghost coefficient in the cells next to a face.

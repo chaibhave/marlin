@@ -44,11 +44,6 @@
       function = u_func
     []
     # buffer values are face values: these depend on the tangential coordinate only
-    [right_value]
-      type = MooseFunctionTensor
-      buffer = right_value
-      function = right_value
-    []
     [bottom_flux]
       type = MooseFunctionTensor
       buffer = bottom_flux
@@ -87,6 +82,12 @@
       type = FiniteDifferenceLaplacian
       input = u
       buffer = lap
+    []
+    # listed after the Laplacian, whose ghost fill reads it: the dependency sort runs it first
+    [right_value]
+      type = MooseFunctionTensor
+      buffer = right_value
+      function = right_value
     []
   []
 []
