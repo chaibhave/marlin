@@ -356,6 +356,38 @@
     []
   []
 
+  [grid_independence_walls]
+    requirement = 'The system shall solve the steady Poisson problem on a domain with Dirichlet, Neumann and Robin faces with the PETSc multigrid preconditioned solver in a number of iterations that does not grow with the grid size'
+    [n64]
+      type = RunApp
+      input = wall_mms.i
+      cli_args = 'TensorSolver/linear_solver=PETSC n=64 Outputs/csv=false -u_ksp_converged_reason'
+      # 7 iterations measured; fail above 12
+      expect_out = 'Linear u_ solve converged due to CONVERGED_RTOL iterations'
+      absent_out = 'iterations ([0-9]{3,}|[2-9][0-9]|1[3-9])\b'
+      compute_devices = 'cpu'
+      detail = 'on a 64 x 64 grid,'
+    []
+    [n128]
+      type = RunApp
+      input = wall_mms.i
+      cli_args = 'TensorSolver/linear_solver=PETSC n=128 Outputs/csv=false -u_ksp_converged_reason'
+      expect_out = 'Linear u_ solve converged due to CONVERGED_RTOL iterations'
+      absent_out = 'iterations ([0-9]{3,}|[2-9][0-9]|1[3-9])\b'
+      compute_devices = 'cpu'
+      detail = 'on a 128 x 128 grid, and'
+    []
+    [n256]
+      type = RunApp
+      input = wall_mms.i
+      cli_args = 'TensorSolver/linear_solver=PETSC n=256 Outputs/csv=false -u_ksp_converged_reason'
+      expect_out = 'Linear u_ solve converged due to CONVERGED_RTOL iterations'
+      absent_out = 'iterations ([0-9]{3,}|[2-9][0-9]|1[3-9])\b'
+      compute_devices = 'cpu'
+      detail = 'on a 256 x 256 grid.'
+    []
+  []
+
   [petsc_options]
     requirement = 'The system shall pass PETSc options to the implicit finite-difference solve under the prefix of the solved field'
     [default]
