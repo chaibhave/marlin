@@ -63,6 +63,10 @@ public:
   static std::pair<std::vector<FDStencilEntry>, Real>
   stencilContributionStatic(unsigned int dim, Real a, Real b, Real c, Real dx);
 
+  /// the constant Robin coefficients a and b
+  Real a() const { return _a; }
+  Real b() const { return _b; }
+
 protected:
   /// c on this rank's face, shaped like a ghost slice (or a scalar tensor for a constant c)
   torch::Tensor faceValue() const;

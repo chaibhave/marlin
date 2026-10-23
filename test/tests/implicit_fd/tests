@@ -452,6 +452,65 @@
     []
   []
 
+  [walls]
+    requirement = 'The system shall solve implicit finite-difference problems on a domain with walls, with Dirichlet, Neumann and Robin conditions whose values vary along the face (from functions and from a buffer) and are taken at the time of the unknown, matching an independent sparse direct solve of the same discretisation, using the torch preconditioned conjugate gradient solver, for'
+    # golds from an independent SciPy assembly of the same discretisation (spsolve); the
+    # error is the O(h^2) discretisation error, observed orders 1.98-1.99 (3-point) and
+    # 1.97-1.99 (5-point) from n = 32 to 128. With the boundary values at t instead of
+    # t + dt, the backward Euler error is 0.044 rather than 0.0026.
+    [poisson_3pt]
+      type = CSVDiff
+      input = wall_mms.i
+      cli_args = 'Outputs/file_base=wall_poisson_3pt'
+      csvdiff = wall_poisson_3pt.csv
+      rel_err = 1e-6
+      compute_devices = 'cpu cuda'
+      min_slots = 2 # memory heavy
+      detail = 'the steady Poisson problem with the 3-point stencil and a Robin face,'
+    []
+    [poisson_5pt]
+      type = CSVDiff
+      input = wall_mms.i
+      cli_args = 'stencil=5 rb=0 Outputs/file_base=wall_poisson_5pt'
+      csvdiff = wall_poisson_5pt.csv
+      rel_err = 1e-6
+      compute_devices = 'cpu cuda'
+      min_slots = 2 # memory heavy
+      detail = 'the steady Poisson problem with the 5-point stencil,'
+    []
+    [be_3pt]
+      type = CSVDiff
+      input = wall_mms.i
+      cli_args = 'tf=1 ops="dudt lap" num_steps=2 Outputs/file_base=wall_be_3pt'
+      csvdiff = wall_be_3pt.csv
+      rel_err = 1e-6
+      compute_devices = 'cpu cuda'
+      min_slots = 2 # memory heavy
+      detail = 'backward Euler with time-dependent boundary values and the 3-point stencil,'
+    []
+    [be_5pt]
+      type = CSVDiff
+      input = wall_mms.i
+      cli_args = 'tf=1 ops="dudt lap" num_steps=2 stencil=5 rb=0 Outputs/file_base=wall_be_5pt'
+      csvdiff = wall_be_5pt.csv
+      rel_err = 1e-6
+      compute_devices = 'cpu cuda'
+      min_slots = 2 # memory heavy
+      detail = 'backward Euler with time-dependent boundary values and the 5-point stencil, and'
+    []
+    [be_3pt_mps]
+      type = CSVDiff
+      input = wall_mms.i
+      # single precision: the solve stops at l_tol = 1e-5, which leaves a solve error of
+      # ~1e-5 |u| on top of the 2.6e-3 discretisation error
+      cli_args = 'tf=1 ops="dudt lap" num_steps=2 TensorSolver/l_tol=1e-5 Outputs/file_base=wall_be_3pt'
+      csvdiff = wall_be_3pt.csv
+      rel_err = 1e-2
+      compute_devices = 'mps'
+      detail = 'backward Euler with the 3-point stencil in single precision on MPS.'
+    []
+  []
+
   [errors]
     requirement = 'The system shall report an error if an implicit finite-difference solve is set up '
     [not_spd]
@@ -530,6 +589,28 @@
       expect_err = '-u_pc_mg_levels is not supported'
       compute_devices = 'cpu'
       detail = 'with a multigrid level count from the PETSc options,'
+    []
+    [wall_robin_5pt]
+      type = RunException
+      input = wall_mms.i
+      cli_args = 'stencil=5'
+      expect_err = 'supports with the 3-point stencil only'
+      detail = 'with a Robin wall and the 5-point stencil,'
+    []
+    [wall_robin_indefinite]
+      type = RunException
+      input = wall_mms.i
+      cli_args = 'ra=-1'
+      expect_err = 'makes the operator indefinite'
+      detail = 'with a Robin wall that makes the operator indefinite,'
+    []
+    [wall_petsc]
+      type = RunException
+      input = wall_mms.i
+      cli_args = 'TensorSolver/linear_solver=PETSC'
+      expect_err = 'The PETSC linear solver does not support non-periodic domains yet'
+      compute_devices = 'cpu'
+      detail = 'with walls and the PETSc linear solver,'
     []
     [not_fd_operator]
       type = RunException
