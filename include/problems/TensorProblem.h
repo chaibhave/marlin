@@ -166,6 +166,14 @@ public:
 
   void runComputeWithGhosts(TensorOperatorBase & compute);
 
+  /// the boundary condition of buffer_name on a face (null if none)
+  const TensorBoundaryCondition * getBoundaryCondition(const std::string & buffer_name,
+                                                       unsigned int face) const
+  {
+    const auto it = _bcs.find({buffer_name, face});
+    return it == _bcs.end() ? nullptr : it->second.get();
+  }
+
   /// fill the ghost layers of buffer_name from the neighbouring ranks, periodic images and the
   /// boundary conditions; with face_axis >= 0, see exchangeFaceDataGhosts
   void exchangeGhostLayers(const std::string & buffer_name,
