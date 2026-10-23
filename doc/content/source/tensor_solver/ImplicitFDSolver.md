@@ -39,7 +39,8 @@ fine level applies the operators matrix-free; the coarse levels are the operator
 grids coarsened by two per axis and assembled, connected by cell-centred multilinear interpolation.
 Every level but the coarsest, which is solved by LU, is smoothed by two sweeps of damped Jacobi
 (`KSPRICHARDSON` + `PCJACOBI`) with the weight $\omega = 4/(3\rho)$, where $\rho = 1 + \sum_{o \ne 0} |a_o| / a_0$ is the Gershgorin bound
-on the Jacobi scaled spectrum from the level's stencil coefficients $a_o$. The weight is recomputed
+on the Jacobi scaled spectrum from the level's stencil coefficients $a_o$, the maximum over the
+rows including those next to a boundary face. The weight is recomputed
 when the operators change (e.g. with the time step), unless `-<buffer>_mg_levels_ksp_richardson_scale`
 is set. PETSc's default Chebyshev smoother estimates its eigenvalue bounds and went indefinite on
 the implicit biharmonic at large time steps.
@@ -50,9 +51,31 @@ every field, and command line options (e.g. `-u_mg_levels_ksp_max_it 3`) overrid
 The `TORCH_PCG` linear solver is a Jacobi preconditioned conjugate gradient method in torch. It runs
 on every device, in single precision on devices without double precision support.
 
+## Boundary conditions
+
+On a non-periodic axis, each face of $u$ has a [TensorDirichletBC.md], [TensorNeumannBC.md] or
+[TensorRobinBC.md] (see the [BCs system](syntax/TensorComputes/BCs/index.md)), with values taken at
+the new time. With boundary values the operator action is affine, $A u + g$, and the solver solves
+$A u = b - g$, with $g$ the action on $u = 0$, recomputed every solve. A Dirichlet face, or a
+Robin face with $a \ne 0$, makes the system definite; with Neumann faces only it keeps the
+constants as its nullspace, and the right-hand side, including the fluxes, must then have zero
+mean. Supported are the time derivative and the Laplacian, with Dirichlet, Neumann and Robin
+faces for the 3-point stencil and Dirichlet and Neumann faces for the 5-point stencil, whose
+second ghost layer makes a Robin operator nonsymmetric. A Robin face with $a / (a/2 + b/\Delta x)
+< 0$ (indefinite) and the biharmonic on a non-periodic domain are errors.
+
+On the coarse multigrid levels, a stencil entry that reaches a ghost cell is folded onto the
+mirrored interior cell, times the ghost factor $-(a/2 - b/s)/(a/2 + b/s)$ of the homogeneous
+condition with $s = (2l+1) h$ for ghost layer $l$ and level spacing $h$ ($-1$ for Dirichlet, $1$
+for Neumann). The interpolation folds the same way. This affects only the preconditioner.
+
 ## Example Input File Syntax
 
 !listing test/tests/implicit_fd/be_mode.i block=TensorSolver
+
+With boundary conditions whose values vary along the faces:
+
+!listing test/tests/implicit_fd/bc_mms.i block=TensorComputes/BCs
 
 !syntax parameters /TensorSolver/ImplicitFDSolver
 

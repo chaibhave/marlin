@@ -19,12 +19,30 @@ over the grid spacing. `TensorDirichletBC` ($a = 1$, $b = 0$) and `TensorNeumann
 ($a = 0$, $b = 1$) are presets of `TensorRobinBC`. Every non-periodic face of a buffer
 that is read with ghost cells needs a boundary condition.
 
+The coefficients $a$ and $b$ are constants. The value $c$ (`value` and `flux` in the
+presets) is a constant, or varies along the face, given by at most one of
+
+- a function (`c_function`, `value_function`, `flux_function`), evaluated at the face
+  position and the cell centres along the face, at the time of the solve: the current
+  time for explicit solvers, the new time for [ImplicitFDSolver.md], or
+- a buffer (`c_buffer`, `value_buffer`, `flux_buffer`), whose first owned cell layer next
+  to the face holds $c$. The compute that writes it must evaluate $c$ at the face
+  position, not at the cell centres. A buffer that no compute or initial condition writes
+  is an error.
+
+A two-layer stencil (the 5-point Laplacian) fills the second ghost layer from the same
+condition with the spacing $3 \Delta x$.
+
 ## Example Input File Syntax
 
 A Dirichlet condition on the left face and a Neumann condition on the right face of a
 domain that is periodic in $y$:
 
 !listing test/tests/real_space/neumann_linear.i block=Domain TensorComputes/BCs
+
+Values that vary along the face, from functions and from buffers:
+
+!listing test/tests/real_space/bc_varying_laplacian.i block=TensorComputes/BCs
 
 !syntax list /TensorComputes/BCs objects=True actions=False subsystems=False
 
