@@ -64,7 +64,7 @@ on every device, in single precision on devices without double precision support
 
 On a non-periodic axis, each face of $u$ has a [TensorDirichletBC.md], [TensorNeumannBC.md] or
 [TensorRobinBC.md] (see the [BCs system](syntax/TensorComputes/BCs/index.md)), with values taken at
-the new time. With boundary values the operator action is affine, $A u + g$, and the solver solves
+the new time for functions and at the start of the substep for buffers. With boundary values the operator action is affine, $A u + g$, and the solver solves
 $A u = b - g$, with $g$ the action on $u = 0$, recomputed every solve. A Dirichlet face, or a
 Robin face with $a \ne 0$, makes the system definite; with Neumann faces only it keeps the
 constants as its nullspace, and the right-hand side, including the fluxes, must then have zero

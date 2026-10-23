@@ -188,7 +188,12 @@ public:
   /// time at which boundary condition values are evaluated: the substep time, plus the offset
   /// an implicit solver sets for the duration of its solve (the time level of the unknown)
   Real boundaryTime() const { return _sub_time + _boundary_time_offset; }
-  void setBoundaryTimeOffset(Real offset) { _boundary_time_offset = offset; }
+
+  /// for the duration of an implicit solve, evaluate boundary values at the substep time plus
+  /// time_offset and hold the boundary conditions' face data (e.g. a c_buffer's halo) fixed,
+  /// so it is exchanged once here rather than on every operator application
+  void beginFixedBoundaryData(Real time_offset);
+  void endFixedBoundaryData();
 
 protected:
   void updateDOFMap();
@@ -245,6 +250,8 @@ protected:
 
   /// see boundaryTime()
   Real _boundary_time_offset = 0.0;
+  /// see beginFixedBoundaryData()
+  bool _boundary_data_fixed = false;
 
   /// simulation time for the currently running output thread
   Real _output_time;

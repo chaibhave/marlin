@@ -27,8 +27,10 @@ presets) is a constant, or varies along the face, given by at most one of
   time for explicit solvers, the new time for [ImplicitFDSolver.md], or
 - a buffer (`c_buffer`, `value_buffer`, `flux_buffer`), whose first owned cell layer next
   to the face holds $c$. The compute that writes it must evaluate $c$ at the face
-  position, not at the cell centres. A buffer that no compute or initial condition writes
-  is an error.
+  position, not at the cell centres. Its values are those the compute last wrote: for
+  [ImplicitFDSolver.md], whose explicit computes run at the start of the substep, they lag
+  the new time by one time step. A buffer that no compute or initial condition writes is
+  an error. The compute runs before any compute that reads the variable with ghost cells.
 
 A two-layer stencil (the 5-point Laplacian) fills the second ghost layer from the same
 condition with the spacing $3 \Delta x$.

@@ -100,7 +100,18 @@ TensorProblem::init()
     cmp->init();
 
   if (_domain.isRealSpaceMode())
+  {
     checkBoundaryConditions();
+
+    // a compute reading a buffer with ghosts also reads what that buffer's boundary conditions
+    // read (e.g. a c_buffer), so the dependency sort runs their writers first
+    for (auto & cmp : _computes)
+      for (const auto & [buffer_name, ghost_layers] : cmp->getInputGhostLayers())
+        for (const auto face : make_range(2 * _dim))
+          if (const auto it = _bcs.find({buffer_name, face}); ghost_layers > 0 && it != _bcs.end())
+            cmp->_requested_buffers.insert(it->second->getRequestedItems().begin(),
+                                           it->second->getRequestedItems().end());
+  }
 
   // update dependencies
   if (_solver)
@@ -671,6 +682,23 @@ TensorProblem::fillBoundaryGhosts(const std::string & buffer_name,
 }
 
 void
+TensorProblem::beginFixedBoundaryData(Real time_offset)
+{
+  _boundary_time_offset = time_offset;
+  // collective: every rank prepares every boundary condition, in the same order
+  for (const auto & [key, bc] : _bcs)
+    bc->prepareFaceData();
+  _boundary_data_fixed = true;
+}
+
+void
+TensorProblem::endFixedBoundaryData()
+{
+  _boundary_time_offset = 0.0;
+  _boundary_data_fixed = false;
+}
+
+void
 TensorProblem::exchangeFaceDataGhosts(const std::string & buffer_name, unsigned int face_axis)
 {
   exchangeGhostLayers(buffer_name, _max_ghost_layers, face_axis);
@@ -696,7 +724,7 @@ TensorProblem::exchangeGhostLayers(const std::string & buffer_name,
 
   // the boundary conditions' face data first, on every rank (the exchange is collective, and
   // only the ranks on a face fill its ghost cells below)
-  if (face_axis < 0)
+  if (face_axis < 0 && !_boundary_data_fixed)
     for (const auto & [key, bc] : _bcs)
       if (key.first == buffer_name)
         bc->prepareFaceData();

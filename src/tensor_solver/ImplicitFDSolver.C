@@ -309,8 +309,9 @@ ImplicitFDSolver::substep()
 
   _iterations = 0;
   _is_converged = true;
-  // the boundary conditions hold at the time level of the unknown, t + dt
-  _tensor_problem.setBoundaryTimeOffset(_sub_dt);
+  // boundary functions are evaluated at the time level of the unknown, t + dt; buffer values
+  // are those the explicit computes above wrote, at t
+  _tensor_problem.beginFixedBoundaryData(_sub_dt);
   std::vector<torch::Tensor> u_old;
   for (auto & field : _fields)
   {
@@ -386,7 +387,7 @@ ImplicitFDSolver::substep()
       for (const auto i : index_range(u_old))
         _fields[i]._u = u_old[i];
       _is_converged = false;
-      _tensor_problem.setBoundaryTimeOffset(0.0);
+      _tensor_problem.endFixedBoundaryData();
       return;
     }
 
@@ -398,7 +399,7 @@ ImplicitFDSolver::substep()
     applyOperator(field, x);
     _tensor_problem.exchangeGhostLayers(field._name, _tensor_problem.getMaxGhostLayer());
   }
-  _tensor_problem.setBoundaryTimeOffset(0.0);
+  _tensor_problem.endFixedBoundaryData();
 }
 
 torch::Tensor
