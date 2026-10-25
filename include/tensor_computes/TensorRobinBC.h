@@ -67,10 +67,9 @@ protected:
   /// c_function at the face position and the tangential cell centres of the ghost slice
   torch::Tensor functionFaceValue(Real t) const;
 
-  /// Robin coefficients: a*u + b*du/dn = c
+  /// Robin coefficients a and b of a*u + b*du/dn = c
   const Real _a;
   const Real _b;
-  const Real _c;
 
   /// constant c as a scalar tensor
   const torch::Tensor _c_scalar;

@@ -37,8 +37,7 @@ TensorRobinBC::TensorRobinBC(const InputParameters & parameters)
     FunctionInterface(this),
     _a(getParam<Real>("a")),
     _b(getParam<Real>("b")),
-    _c(getParam<Real>("c")),
-    _c_scalar(torch::tensor(_c, MooseTensor::floatTensorOptions())),
+    _c_scalar(torch::tensor(getParam<Real>("c"), MooseTensor::floatTensorOptions())),
     _c_function(isParamValid("c_function") ? &getFunction("c_function") : nullptr),
     _c_buffer(isParamValid("c_buffer") ? &getInputBuffer("c_buffer") : nullptr),
     _c_function_time(std::numeric_limits<Real>::quiet_NaN())
@@ -152,7 +151,8 @@ void
 TensorRobinBC::prepareFaceData()
 {
   if (_c_buffer)
-    _tensor_problem.exchangeFaceDataGhosts(getParam<TensorInputBufferName>("c_buffer"), faceDim());
+    _tensor_problem.exchangeGhostLayers(
+        getParam<TensorInputBufferName>("c_buffer"), _tensor_problem.getMaxGhostLayer(), faceDim());
 }
 
 torch::Tensor

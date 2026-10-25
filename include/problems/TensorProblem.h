@@ -175,15 +175,13 @@ public:
   }
 
   /// fill the ghost layers of buffer_name from the neighbouring ranks, periodic images and the
-  /// boundary conditions; with face_axis >= 0, see exchangeFaceDataGhosts
+  /// boundary conditions. With face_axis >= 0, buffer_name is face data (a boundary condition's
+  /// c along a face normal to face_axis) and only its halo along the other axes is filled: from
+  /// the neighbouring ranks and periodic images, and with the nearest owned value on a
+  /// non-periodic boundary
   void exchangeGhostLayers(const std::string & buffer_name,
                            unsigned int ghost_layers,
                            int face_axis = -1);
-
-  /// fill the halo of face data (a boundary condition's c along a face normal to face_axis)
-  /// along the other axes: from the neighbouring ranks and periodic images, and with the
-  /// nearest owned value on a non-periodic boundary
-  void exchangeFaceDataGhosts(const std::string & buffer_name, unsigned int face_axis);
 
   /// time at which boundary condition values are evaluated: the substep time, plus the offset
   /// an implicit solver sets for the duration of its solve (the time level of the unknown)

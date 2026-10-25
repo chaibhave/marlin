@@ -699,12 +699,6 @@ TensorProblem::endFixedBoundaryData()
 }
 
 void
-TensorProblem::exchangeFaceDataGhosts(const std::string & buffer_name, unsigned int face_axis)
-{
-  exchangeGhostLayers(buffer_name, _max_ghost_layers, face_axis);
-}
-
-void
 TensorProblem::exchangeGhostLayers(const std::string & buffer_name,
                                    unsigned int ghost_layers,
                                    int face_axis)
