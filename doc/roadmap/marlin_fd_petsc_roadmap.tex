@@ -453,7 +453,8 @@ against a direct solve with the buffer value at $t^n$ (error 0.0225 against
 discrete mean of order $h^2$; it is an error rather than projected out, so a
 genuine inconsistency is not hidden. Documented in \texttt{ImplicitFDSolver.md}.
 \item \textbf{A Robin face with $ab < 0$ is an error} (user, 2026-10-25): its
-ghost term $a/(a/2 + b/dx)$ turns negative once $dx < 2|b/a|$, so whether a
+ghost term $a/(a/2 + b/dx)$ turns negative once $dx < 2|b/a|$, after which the
+operator may be indefinite (depending on the rest of the problem), so whether a
 problem solved depended on the grid; behaviour should not change with $dx$.
 \item \textbf{Central advection at high cell P\'eclet deferred, CUDA graph
 capture not adopted} (user, 2026-10-18; PR2c).

@@ -70,11 +70,12 @@ $u = 0$, recomputed every solve. A Dirichlet face, or a Robin face with $a \ne 0
 definite; with Neumann faces only it keeps the constants as its nullspace, and the right-hand
 side, including the fluxes, must then have zero mean up to round-off. Source and fluxes that
 balance in the continuous problem generally leave a discrete mean of order $h^2$, which is an
-error: the data must balance on the grid. Supported are the time derivative and the Laplacian, with Dirichlet, Neumann and Robin
-faces for the 3-point stencil and Dirichlet and Neumann faces for the 5-point stencil, whose
-second ghost layer makes a Robin operator nonsymmetric. A Robin face with $a b < 0$ is an error:
-its ghost term $a / (a/2 + b/\Delta x)$ turns negative, and the operator indefinite, once
-$\Delta x < 2 |b / a|$, so whether it solves would depend on the grid. The biharmonic on a
+error: the data must balance on the grid. Supported are the time derivative and the Laplacian,
+with Dirichlet, Neumann and Robin faces for the 3-point stencil and Dirichlet and Neumann faces
+for the 5-point stencil, whose second ghost layer makes a Robin operator nonsymmetric. A Robin
+face with $a b < 0$ is an error: its ghost term $a / (a/2 + b/\Delta x)$ turns negative once
+$\Delta x < 2 |b / a|$, after which the operator may be indefinite, depending on the rest of the
+problem, so whether it could be solved would depend on the grid. The biharmonic on a
 non-periodic domain is an error too.
 
 On the coarse multigrid levels, a stencil entry that reaches a ghost cell is folded onto the

@@ -253,7 +253,8 @@ ImplicitFDSolver::ImplicitFDSolver(const InputParameters & parameters)
                    bc->name(),
                    "' of field '",
                    buffers[i],
-                   "' has a*b < 0, for which the operator is indefinite on fine enough grids.");
+                   "' has a*b < 0, for which the ghost term a/(a/2 + b/dx) is negative on fine "
+                   "enough grids and the operator may be indefinite.");
       if (a != 0.0)
         definite = true;
 
