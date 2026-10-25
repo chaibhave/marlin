@@ -1331,6 +1331,15 @@ decided.
 \textbf{Verification:} MMS with spatially varying $D$; cross-validation
 against \texttt{examples/cahn\_hilliard/cahnhilliard\_fem.i} and/or
 \texttt{ReciprocalMatDiffusion} on a periodic case.
+A parallel-plate capacitor (user, 2026-10-25): two dielectric slabs
+($\varepsilon_r$ 1 and 100) between plates at a potential difference $V$,
+plates spanning the domain with zero-flux top and bottom so the problem is
+1D; the plate charge against the series capacitance
+$C/A = \varepsilon_0 / (d_1/\varepsilon_{r1} + d_2/\varepsilon_{r2})$, a
+uniform displacement $D$ and the potential split between the slabs. Metal
+plates as $\varepsilon_r = 10^9$ inside the domain test the solver at that
+contrast (relative-residual test, coarse coefficients); Dirichlet faces in
+place of the plates give the same capacitance without it.
 
 \status{proposed.}
 
