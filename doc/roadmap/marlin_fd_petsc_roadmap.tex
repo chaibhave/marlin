@@ -1269,7 +1269,11 @@ findings addressed; tests pass on CPU serial and multi-rank (user); rebased onto
 buffer values) matches an independent sparse direct solve of the same discretisation to
 $10^{-6}$ relative for both backends; observed order 1.97--1.99. PCMG iterations
 ($l_{tol}=10^{-10}$, CPU) at $n = 64, 128, 256$: 7, 6, 6 with boundary faces, against 9, 9, 9
-periodic, the same with either smoother. MPS and CUDA runs of the PR4 tests: not recorded here.}
+periodic, the same with either smoother. Crank's semi-infinite and thin-slab diffusion
+solutions (the explicit \texttt{real\_space} benchmarks, with the implicit solver): error
+$5.8\times10^{-3}$, $1.7\times10^{-3}$, $6.7\times10^{-4}$ at 25, 100, 400 substeps, first order
+down to the semi-discrete floor $3.2\times10^{-4}$, both backends, golds from an independent
+dense solve. MPS and CUDA runs of the PR4 tests: not recorded here.}
 
 \pr{4b}{No-Flux Biharmonic and PFHub 1b}
 \textbf{Scope:} \texttt{FiniteDifferenceBiharmonic} with non-periodic

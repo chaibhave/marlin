@@ -578,6 +578,33 @@
     []
   []
 
+  [crank]
+    requirement = 'The system shall reproduce analytic diffusion solutions from Crank, "The Mathematics of Diffusion" (2nd ed.), with implicit backward Euler finite differences and Dirichlet faces, matching an independent dense solve of the same discretisation, for'
+    # golds from a dense SciPy backward Euler solve (the cell-centred 3-point
+    # Laplacian with ghost 2c - u0). The error against the analytic solution is first order in
+    # the substep down to the spatial floor of the semi-discrete solution, 3.2e-4: 5.8e-3, 1.7e-3,
+    # 6.7e-4 at 25, 100, 400 substeps. The explicit real_space tests of the same problems give
+    # 2.3e-4 with 250 forward Euler substeps.
+    [semi_infinite]
+      type = CSVDiff
+      input = crank_semi_infinite.i
+      csvdiff = crank_semi_infinite_out.csv
+      rel_err = 1e-6
+      compute_devices = 'cpu cuda'
+      min_slots = 2 # memory heavy
+      detail = 'a semi-infinite medium with a constant surface concentration (Sec. 3.3(i), eq. 3.13), and'
+    []
+    [thin_slab]
+      type = CSVDiff
+      input = crank_thin_slab.i
+      csvdiff = crank_thin_slab_out.csv
+      rel_err = 1e-6
+      compute_devices = 'cpu cuda'
+      min_slots = 2 # memory heavy
+      detail = 'an instantaneous planar source in a thin slab diffusing into an infinite medium (Sec. 2.5, eq. 2.15).'
+    []
+  []
+
   [bcs_petsc]
     requirement = 'The system shall solve implicit finite-difference problems on a non-periodic domain, with Dirichlet, Neumann and Robin conditions whose values vary along the face, matching an independent sparse direct solve of the same discretisation, using the PETSc conjugate gradient solver with geometric multigrid, for'
     [poisson_3pt]
