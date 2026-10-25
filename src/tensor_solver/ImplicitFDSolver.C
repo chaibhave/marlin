@@ -439,27 +439,18 @@ fieldStencil(const std::vector<const LinearFDOperator *> & fd_operators,
   }
   return stencil;
 }
-
-/// summed centre coefficient and sum of |a_o| over the other entries of a stencil; the
-/// centre of a positive (semi)definite nonzero operator is positive
-std::pair<Real, Real>
-centreAndOffDiagonal(const std::vector<FDStencilEntry> & stencil)
-{
-  Real centre = 0.0, off_diagonal = 0.0;
-  for (const auto & entry : stencil)
-    if (std::all_of(entry.offset.begin(), entry.offset.end(), [](int o) { return o == 0; }))
-      centre += entry.coefficient;
-    else
-      off_diagonal += std::abs(entry.coefficient);
-  mooseAssert(centre > 0.0, "The centre stencil coefficient must be positive");
-  return {centre, off_diagonal};
-}
 }
 
 Real
 ImplicitFDSolver::diagonal(const Field & field) const
 {
-  return centreAndOffDiagonal(fieldStencil(field._fd_operators)).first;
+  // the centre of a positive (semi)definite nonzero operator is positive
+  Real centre = 0.0;
+  for (const auto & entry : fieldStencil(field._fd_operators))
+    if (std::all_of(entry.offset.begin(), entry.offset.end(), [](int o) { return o == 0; }))
+      centre += entry.coefficient;
+  mooseAssert(centre > 0.0, "The centre stencil coefficient must be positive");
+  return centre;
 }
 
 torch::Tensor
