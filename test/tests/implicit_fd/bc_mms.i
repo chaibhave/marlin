@@ -11,6 +11,7 @@
 # Each face has a different condition and value source:
 #   left   (x = 0)  Dirichlet   u = cos(pi y) - tf t y^2                     function
 #   right  (x = 1)  Robin       ra u + rb du/dx = c                         function
+#                                                      or buffer (right_buffer, steady)
 #   bottom (y = 0)  Neumann     du/dn = -du/dy = -x                          buffer
 #   top    (y = 1)  Neumann     du/dn = du/dy = x - 2 tf t                   function
 #                                                      or buffer (top_buffer, values at t)
@@ -71,6 +72,8 @@ rb = 1
   []
   [bottom_flux]
   []
+  [right_c]
+  []
   [top_flux]
   []
   [exact]
@@ -97,6 +100,11 @@ rb = 1
       buffer = bottom_flux
       function = bottom_flux
     []
+    [right_c]
+      type = MooseFunctionTensor
+      buffer = right_c
+      function = right_c
+    []
   []
   [BCs]
     active = 'left right bottom top'
@@ -113,6 +121,15 @@ rb = 1
       a = ${ra}
       b = ${rb}
       c_function = right_c
+    []
+    # the Robin c from a buffer instead (active = 'left right_buffer bottom top'), steady only
+    [right_buffer]
+      type = TensorRobinBC
+      variable = u
+      boundary = right
+      a = ${ra}
+      b = ${rb}
+      c_buffer = right_c
     []
     [bottom]
       type = TensorNeumannBC

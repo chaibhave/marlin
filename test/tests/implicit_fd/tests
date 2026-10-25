@@ -511,6 +511,18 @@
       min_slots = 2 # memory heavy
       detail = 'the steady Poisson problem with the 3-point stencil and a Robin face,'
     []
+    [poisson_3pt_robin_buffer]
+      type = CSVDiff
+      input = bc_mms.i
+      # the Robin c from a buffer, whose halo along the face is exchanged across ranks
+      cli_args = 'TensorComputes/BCs/active="left right_buffer bottom top" Outputs/file_base=bc_poisson_3pt_robin_buffer'
+      # same gold as poisson_3pt: the buffer holds right_c, and the problem is steady
+      csvdiff = bc_poisson_3pt_robin_buffer.csv
+      rel_err = 1e-6
+      compute_devices = 'cpu cuda'
+      min_slots = 2 # memory heavy
+      detail = 'the same with the Robin value from a buffer,'
+    []
     [poisson_5pt]
       type = CSVDiff
       input = bc_mms.i
@@ -700,7 +712,7 @@
       type = RunException
       input = bc_mms.i
       cli_args = 'ra=-1'
-      expect_err = 'has a\*b < 0, for which the operator is indefinite on fine enough grids'
+      expect_err = 'has a\*b < 0, for which the ghost term a/\(a/2 \+ b/dx\) is negative on fine enough grids'
       detail = 'with a Robin face with a b < 0,'
     []
     [bc_robin_ab_negative_coarse]
@@ -708,7 +720,7 @@
       input = bc_mms.i
       # definite at this n (a/(a/2 + b/dx) = 5.6), indefinite from n = 51 (dx < 2|b/a| = 0.02)
       cli_args = 'rb=-0.01 n=32'
-      expect_err = 'has a\*b < 0, for which the operator is indefinite on fine enough grids'
+      expect_err = 'has a\*b < 0, for which the ghost term a/\(a/2 \+ b/dx\) is negative on fine enough grids'
       detail = 'with a Robin face with a b < 0 on a grid where its operator is still definite,'
     []
     [biharmonic_bc]
