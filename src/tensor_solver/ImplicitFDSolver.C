@@ -244,15 +244,16 @@ ImplicitFDSolver::ImplicitFDSolver(const InputParameters & parameters)
                    "' is not a TensorRobinBC, which ImplicitFDSolver requires.");
       field._face_bcs[face] = face_bc;
 
+      // with a*b >= 0 the ghost term a/(a/2 + b/dx) is positive for every dx; with a*b < 0 its
+      // sign, and so the definiteness of the operator, would depend on the grid
       const auto a = face_bc->a(), b = face_bc->b();
-      const auto dx = _domain.getGridSpacing()(d);
-      if (a != 0.0 && a / (a / 2.0 + b / dx) < 0.0)
+      if (a * b < 0.0)
         paramError("buffer",
                    "Boundary condition '",
                    bc->name(),
                    "' of field '",
                    buffers[i],
-                   "' has a/(a/2 + b/dx) < 0, which makes the operator indefinite.");
+                   "' has a*b < 0, for which the operator is indefinite on fine enough grids.");
       if (a != 0.0)
         definite = true;
 

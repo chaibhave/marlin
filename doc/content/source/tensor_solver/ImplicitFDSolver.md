@@ -72,8 +72,10 @@ side, including the fluxes, must then have zero mean up to round-off. Source and
 balance in the continuous problem generally leave a discrete mean of order $h^2$, which is an
 error: the data must balance on the grid. Supported are the time derivative and the Laplacian, with Dirichlet, Neumann and Robin
 faces for the 3-point stencil and Dirichlet and Neumann faces for the 5-point stencil, whose
-second ghost layer makes a Robin operator nonsymmetric. A Robin face with $a / (a/2 + b/\Delta x)
-< 0$ (indefinite) and the biharmonic on a non-periodic domain are errors.
+second ghost layer makes a Robin operator nonsymmetric. A Robin face with $a b < 0$ is an error:
+its ghost term $a / (a/2 + b/\Delta x)$ turns negative, and the operator indefinite, once
+$\Delta x < 2 |b / a|$, so whether it solves would depend on the grid. The biharmonic on a
+non-periodic domain is an error too.
 
 On the coarse multigrid levels, a stencil entry that reaches a ghost cell is folded onto the
 mirrored interior cell, times the ghost factor $-(a/2 - b/s)/(a/2 + b/s)$ of the homogeneous
