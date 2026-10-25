@@ -64,11 +64,13 @@ on every device, in single precision on devices without double precision support
 
 On a non-periodic axis, each face of $u$ has a [TensorDirichletBC.md], [TensorNeumannBC.md] or
 [TensorRobinBC.md] (see the [BCs system](syntax/TensorComputes/BCs/index.md)), with values taken at
-the new time for functions and at the start of the substep for buffers. With boundary values the operator action is affine, $A u + g$, and the solver solves
-$A u = b - g$, with $g$ the action on $u = 0$, recomputed every solve. A Dirichlet face, or a
-Robin face with $a \ne 0$, makes the system definite; with Neumann faces only it keeps the
-constants as its nullspace, and the right-hand side, including the fluxes, must then have zero
-mean. Supported are the time derivative and the Laplacian, with Dirichlet, Neumann and Robin
+the new time for functions and at the start of the substep for buffers. With boundary values the
+operator action is affine, $A u + g$, and the solver solves $A u = b - g$, with $g$ the action on
+$u = 0$, recomputed every solve. A Dirichlet face, or a Robin face with $a \ne 0$, makes the system
+definite; with Neumann faces only it keeps the constants as its nullspace, and the right-hand
+side, including the fluxes, must then have zero mean up to round-off. Source and fluxes that
+balance in the continuous problem generally leave a discrete mean of order $h^2$, which is an
+error: the data must balance on the grid. Supported are the time derivative and the Laplacian, with Dirichlet, Neumann and Robin
 faces for the 3-point stencil and Dirichlet and Neumann faces for the 5-point stencil, whose
 second ghost layer makes a Robin operator nonsymmetric. A Robin face with $a / (a/2 + b/\Delta x)
 < 0$ (indefinite) and the biharmonic on a non-periodic domain are errors.
