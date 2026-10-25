@@ -388,6 +388,17 @@
     []
   []
 
+  [jacobi_diagonal_bcs]
+    requirement = 'The system shall give the PETSc solver the diagonal of the operator including the boundary face terms, used by a Jacobi preconditioner'
+    # Jacobi-preconditioned CG takes 164 iterations; with the interior diagonal also in the
+    # cells next to a face it takes 95, so the count tells the two apart
+    type = RunApp
+    input = bc_mms.i
+    cli_args = 'TensorSolver/linear_solver=PETSC n=64 Outputs/csv=false -u_pc_type jacobi -u_ksp_converged_reason'
+    expect_out = 'Linear u_ solve converged due to CONVERGED_RTOL iterations 164\b'
+    compute_devices = 'cpu'
+  []
+
   [petsc_options]
     requirement = 'The system shall pass PETSc options to the implicit finite-difference solve under the prefix of the solved field'
     [default]
@@ -679,6 +690,13 @@
       cli_args = 'ra=-1'
       expect_err = 'makes the operator indefinite'
       detail = 'with a Robin face that makes the operator indefinite,'
+    []
+    [biharmonic_bc]
+      type = RunException
+      input = biharmonic_mode.i
+      cli_args = 'Domain/periodic_directions=Y TensorComputes/BCs/left/type=TensorNeumannBC TensorComputes/BCs/left/variable=u TensorComputes/BCs/left/boundary=left'
+      expect_err = 'is a FiniteDifferenceBiharmonic, which ImplicitFDSolver supports on periodic domains only'
+      detail = 'with a biharmonic operator on a non-periodic domain,'
     []
     [not_fd_operator]
       type = RunException
