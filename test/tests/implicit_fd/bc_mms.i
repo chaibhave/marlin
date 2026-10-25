@@ -13,6 +13,7 @@
 #   right  (x = 1)  Robin       ra u + rb du/dx = c                         function
 #   bottom (y = 0)  Neumann     du/dn = -du/dy = -x                          buffer
 #   top    (y = 1)  Neumann     du/dn = du/dy = x - 2 tf t                   function
+#                                                      or buffer (top_buffer, values at t)
 
 D = 0.5
 n = 32
@@ -70,6 +71,8 @@ rb = 1
   []
   [bottom_flux]
   []
+  [top_flux]
+  []
   [exact]
   []
   [diff]
@@ -96,6 +99,7 @@ rb = 1
     []
   []
   [BCs]
+    active = 'left right bottom top'
     [left]
       type = TensorDirichletBC
       variable = u
@@ -122,8 +126,21 @@ rb = 1
       boundary = top
       flux_function = top_flux
     []
+    # the top flux from a buffer instead (active = 'left right bottom top_buffer'); a buffer
+    # value is the one its compute wrote at the start of the substep, at t
+    [top_buffer]
+      type = TensorNeumannBC
+      variable = u
+      boundary = top
+      flux_buffer = top_flux
+    []
   []
   [Solve]
+    [top_flux]
+      type = MooseFunctionTensor
+      buffer = top_flux
+      function = top_flux
+    []
     [dudt]
       type = TimeDerivativeOperator
       buffer = dudt_u
