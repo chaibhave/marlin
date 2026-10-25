@@ -444,6 +444,17 @@ evaluated at $t^{n+1}$; buffer-valued ones hold what their compute wrote at
 the start of the substep ($t^n$), a one-step lag. This is documented, not
 changed: only an explicit function of time can be evaluated at $t^{n+1}$;
 removing the other lags is what a Picard iteration does (input to PR6).
+Reaffirmed in the PR4 milestone review (user, 2026-10-25), with the test
+requirement corrected and \texttt{bcs/be\_3pt\_buffer} checking the lag
+against a direct solve with the buffer value at $t^n$ (error 0.0225 against
+0.0026 for a function).
+\item \textbf{Strict zero-mean check with Neumann faces only} (user,
+2026-10-25). Data that balance in the continuous problem generally leave a
+discrete mean of order $h^2$; it is an error rather than projected out, so a
+genuine inconsistency is not hidden. Documented in \texttt{ImplicitFDSolver.md}.
+\item \textbf{A Robin face with $ab < 0$ is an error} (user, 2026-10-25): its
+ghost term $a/(a/2 + b/dx)$ turns negative once $dx < 2|b/a|$, so whether a
+problem solved depended on the grid; behaviour should not change with $dx$.
 \item \textbf{Central advection at high cell P\'eclet deferred, CUDA graph
 capture not adopted} (user, 2026-10-18; PR2c).
 \end{enumerate}
