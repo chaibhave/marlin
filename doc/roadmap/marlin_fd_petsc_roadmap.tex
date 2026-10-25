@@ -173,7 +173,7 @@ the fine level and on CUDA, where PETSc's SOR runs on the host. The
 \texttt{KSP\_DIVERGED\_INDEFINITE\_PC} seen on CUDA for 1a came from stale bounds:
 without a DM, PCMG sets up only the fine smoother again on a new matrix, so the
 coarse levels kept the bounds of the first $dt$. Each coarse smoother's operators
-are now reset after reassembly. \texttt{smoother = DAMPED\_JACOBI} is
+are reset after reassembly. \texttt{smoother = DAMPED\_JACOBI} is
 Richardson + Jacobi with the Gershgorin weight; a user-set
 \texttt{-<field>\_mg\_levels\_ksp\_richardson\_scale} wins. The analytic-bounds
 hook (\texttt{KSPChebyshevSetEigenvalues}) was not built.
@@ -1152,8 +1152,8 @@ round-off. Section~\ref{sec:architecture} describes the backends.
 Not built from the PR3 design: the Chebyshev analytic-bounds hook; a
 pointer-equality zero-copy test in the production tests (zero-copy is by
 \texttt{VecPlaceArray} on the solver's tensors and was checked by
-\texttt{-log\_view} on H200); a change to PETSc's DTOL default with warm
-starts (left as PETSc's default).
+\texttt{-log\_view} on H200). The DTOL default with warm starts was left to PR3b
+(decision~9).
 
 \textbf{Verification:} \texttt{test/tests/implicit\_fd}: Poisson MMS
 (singular, zero-mean), backward Euler against the exact discrete
@@ -1188,8 +1188,8 @@ works with ghost layers on several ranks.
 Jacobi with the Gershgorin weight; coarse Chebyshev bounds re-estimated when the
 operators change; the coarsest level solved by LU (decision~8).
 \item No PETSc divergence test (decision~9).
-\item Review fixes for \#189: the biharmonic kernel is built once; a shared
-centre/off-diagonal helper asserting a positive centre; a 2-rank
+\item Review fixes for \#189: the biharmonic kernel is built once; the Jacobi
+diagonal asserts a positive centre; a 2-rank
 \texttt{integral\_change} test; the notebook skips a missing implicit FD output.
 \item Coarse matrices preallocated from the stencil's columns (the DMDA box
 preallocation stored 729 entries per row for 73 used with the 3D 5-point
@@ -1388,7 +1388,7 @@ PR2 & DMDA/decomposition compatibility & spike, not merged; superseded by \textt
 PR2b & Multi-rank PCMG & spike done (\texttt{b3dcd72}) & PETSc-owned hierarchy + cell-centred transfer adopted (user, 2026-10-18) \\
 PR2c & Non-SPD + torch PCSHELL smoother + fusion & spike done (\texttt{40f6977}, \texttt{65109ae}) & GS robust for upwind; central Pe $\ge1$ deferred; CUDA traced 2.4--3.2$\times$ eager \\
 PR3 & ImplicitFDSolver, periodic, matrix-free & merged (PR \#188) & MMS and BE orders 2/4; CPU 1--4 ranks, MPS, H200 \\
-PR3b & Biharmonic, PFHub 1a input, Jacobi smoothing, preallocation, scaling script & PR \#189 open, not merged & biharmonic Fourier mode 2D/3D, both backends \\
+PR3b & Biharmonic, PFHub 1a input, smoother choice (Chebyshev default), no divergence test, preallocation, scaling script & PR \#189 open, not merged & biharmonic Fourier mode 2D/3D, both backends \\
 PR4 & BCs in ImplicitFDSolver, face-varying values & implemented, pre-push reviewed, findings addressed; CPU serial and multi-rank pass; rebased onto \#189 head, no PR yet & MMS vs.\ direct solve, both backends; PCMG iterations flat in $n$ \\
 PR4b & No-flux biharmonic, PFHub 1b & proposed & --- \\
 PR4a & AMG mixed mode, contingent & proposed & --- \\
