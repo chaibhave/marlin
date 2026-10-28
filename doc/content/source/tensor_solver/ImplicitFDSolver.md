@@ -49,8 +49,8 @@ The solve stops when the unpreconditioned residual satisfies
 $\|b - A u\|_2 \le$ [!param](/TensorSolver/ImplicitFDSolver/l_tol) $\|b\|_2$, starting from the
 previous solution. When a solve does not converge within
 [!param](/TensorSolver/ImplicitFDSolver/l_max_its) iterations, a
-`TensorSolveIterationAdaptiveDT` time stepper retries the time step with a smaller time step
-(with one substep per time step); with any other time stepper it is an error. After the solve, the
+`TensorSolveIterationAdaptiveDT` time stepper retries the time step with a smaller time step;
+with any other time stepper it is an error. After the solve, the
 operators' output buffers hold the operators applied to the new solution.
 
 The [!param](/TensorSolver/ImplicitFDSolver/root_compute) is evaluated before every solve (with
@@ -134,7 +134,7 @@ linear iterations is printed with it.
 
 On a non-periodic axis, each face of $u$ has a [TensorDirichletBC.md], [TensorNeumannBC.md] or
 [TensorRobinBC.md] (see the [BCs system](syntax/TensorComputes/BCs/index.md)), with values taken at
-the new time for functions and at the start of the substep for buffers (at the iterate with
+the new time for functions and at the start of the time step for buffers (at the iterate with
 [!param](/TensorSolver/ImplicitFDSolver/nonlinear_solve)). With boundary values the
 operator action is affine, $A u + g$, and the solver solves $A u = b - g$, with $g$ the action on
 $u = 0$, recomputed every solve. A Dirichlet face, or a Robin face with $a \ne 0$, makes the system
